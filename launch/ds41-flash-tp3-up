@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# ds41-flash-tp3-up — one-command bring-up for DeepSeek-V4.1-Flash TP3
+# on 3× DGX Spark (eugr b12x vLLM fork).
+#
+# Usage:
+#   ./launch/ds41-flash-tp3-up preflight   # verify image, checkpoint, fabric
+#   ./launch/ds41-flash-tp3-up stage-env    # copy cluster.env to all boxes
+#   ./launch/ds41-flash-tp3-up start --yes  # launch workers→head
+#   ./launch/ds41-flash-tp3-up stop         # graceful stop all
+#   ./launch/ds41-flash-tp3-up health       # check :8600 on head
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ENV_SRC="${ENV_SRC:-$SCRIPT_DIR/../config/cluster.env}"
+
+# ---- cluster definition (EDIT THESE for your boxes) ----
+SPARK_HEAD="${SPARK_HEAD:-spark-head.local}"     # head / rank 0
+SPARK_A="${SPARK_A:-spark-a.local}"              # worker / rank 1
+SPARK_B="${SPARK_B:-spark-b.local}"              # worker / rank 2
+HEAD_IP="${HEAD_IP:-192.168.0.10}"               # head's management LAN IP
+WORKER_A_IP="${WORKER_A_IP:-192.168.0.11}"
+WORKER_B_IP="${WORKER_B_IP:-192.168.0.12}"
+
+ALL_BOXES=("$SPARK_HEAD" "$SPARK_A" "$SPARK_B")
+CONTAINER_NAME="ds41-flash-tp3"
+
+say() { printf '\e[1;36m[ds41-tp3]\e[0m %s\n' "$*"; }
+die() { printf '\e[1;31m[ds41-tp3]\e[0m FATAL: %s\n' "$*" >&2; exit 1; }
+
+on() { ssh -o BatchMode=yes -o ConnectTimeout=8 "$1" "${@:2}"; }
+
+# ---------------------------------------------------------------- preflight
+do_preflight() {
+  say "preflight: verifying image, checkpoint, fabric on all boxes"
+  for box in "${ALL_BOXES[@]}"; do
+    say "  checking $box"
+    on "$box" "
+      docker images --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | \
+        grep -qx '$(source "$ENV_SRC" && echo "$IMAGE")' || \
+        { echo '  MISSING: image not staged'; exit 1; }
+      [ -d \"\$(source "$ENV_SRC" && echo "$MODEL_DIR")\" ] || \
+        { echo '  MISSING: checkpoint not staged'; exit 1; }
+      free -g | awk '/Mem:/{if ($$7 < 100) { print "  WARN: only " $$7 " GiB free"; }}
+                     /^Swap:/ && $$3 > 0 { print "  WARN: swap in use"; }'
+      echo "  OK"
+    " || die "preflight failed on $box"
+  done
+  say "preflight: all boxes pass"
+}
+
+# ---------------------------------------------------------------- stage-env
+do_stage_env() {
+  say "stage-env: copying cluster.env to all boxes"
+  for box in "${ALL_BOXES[@]}"; do
+    say "  staging to $box"
+    scp -q "$ENV_SRC" "$box:ds41-flash-tp3/config/cluster.env" \
+      || die "failed to stage env to $box"
+  done
+  say "stage-env: done"
+}
+
+# ---------------------------------------------------------------- start
+do_start() {
+  local CONFIRM="${1:-}"
+  [ "$CONFIRM" = "--yes" ] || { say "pass --yes to confirm"; exit 1; }
+
+  say "start: dropping page cache on all boxes"
+  for box in "${ALL_BOXES[@]}"; do
+    on "$box" "sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; \
+      docker rm -f $CONTAINER_NAME 2>/dev/null; true"
+  done
+
+  say "start: launching head ($SPARK_HEAD, rank 0)"
+  on "$SPARK_HEAD" "
+    cd ~/ds41-flash-tp3
+    source config/cluster.env
+    NODE_IP=$HEAD_IP NODE_RANK=0 ROLE=head GMU=\$GMU \
+      setsid nohup bash start-tp3-fork.sh > /tmp/ds41-boot-head.log 2>&1 &
+  " || die "head launch failed"
+  sleep 15
+
+  say "start: launching workers"
+  on "$SPARK_A" "
+    cd ~/ds41-flash-tp3
+    source config/cluster.env
+    NODE_IP=$WORKER_A_IP NODE_RANK=1 ROLE=worker HEAD_IP=$HEAD_IP GMU=\$GMU \
+      setsid nohup bash start-tp3-fork.sh > /tmp/ds41-boot-w1.log 2>&1 &
+  " || die "worker A launch failed"
+
+  on "$SPARK_B" "
+    cd ~/ds41-flash-tp3
+    source config/cluster.env
+    NODE_IP=$WORKER_B_IP NODE_RANK=2 ROLE=worker HEAD_IP=$HEAD_IP GMU=\$GMU \
+      setsid nohup bash start-tp3-fork.sh > /tmp/ds41-boot-w2.log 2>&1 &
+  " || die "worker B launch failed"
+
+  say "start: all three launched; health in ~10–12 min"
+  say "  check: curl http://$HEAD_IP:8600/health"
+}
+
+# ---------------------------------------------------------------- stop
+do_stop() {
+  say "stop: removing containers on all boxes"
+  for box in "${ALL_BOXES[@]}"; do
+    on "$box" "docker rm -f $CONTAINER_NAME 2>/dev/null; true"
+  done
+  say "stop: done"
+}
+
+# ---------------------------------------------------------------- health
+do_health() {
+  say "health: checking engine on $HEAD_IP:8600"
+  on "$SPARK_HEAD" "curl -s -o /dev/null -w '%{http_code}\n' --max-time 6 \
+    http://localhost:8600/health" | \
+    while read -r code; do
+      if [ "$code" = "200" ]; then
+        say "health: UP (200)"
+      else
+        say "health: DOWN ($code)"
+        exit 1
+      fi
+    done
+}
+
+# ---------------------------------------------------------------- main
+case "${1:-}" in
+  preflight)  do_preflight ;;
+  stage-env)  do_stage_env ;;
+  start)      do_start "${2:-}" ;;
+  stop)       do_stop ;;
+  health)     do_health ;;
+  *)          echo "Usage: $0 {preflight|stage-env|start [--yes]|stop|health}"; exit 1 ;;
+esac
