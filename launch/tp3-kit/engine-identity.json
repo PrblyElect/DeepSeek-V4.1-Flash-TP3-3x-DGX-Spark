@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "recorded_by": "engine-identity audit",
   "why": "Provenance + behaviour contract for the image this recipe serves. The image is ALSO patched at runtime by the bootstrap (the valid_object shim), so a manifest digest alone does not prove what is running: the build stamp and the engine-critical file hashes do. A NEW upstream nightly will FAIL this gate until it is re-audited -- that is the intended adoption gate, not a bug.",
   "build_stamp": {
@@ -15,15 +15,72 @@
   },
   "files": {
     "vllm/models/deepseek_v41/__init__.py": "df41663a355a13140fb27ba4ef72d34ecc6e0bcbcacb51ee4b08ad4cef7c988c",
+    "vllm/models/deepseek_v41/nvidia/model.py": "60e8557199e513f856471eab038e29bfcc28b2a10bd93dad0f907c560d5d168c",
+    "vllm/models/deepseek_v4/nvidia/model.py": "109236e3b5868f74922f9d270a2d82776f498855b284666279613002b65016ea",
     "vllm/models/deepseek_v4_1/common/engram.py": "efda07bdd54d947852cdf75095905033038cf2a4425d7b234d092a9253c7c811",
     "vllm/models/deepseek_v4_1/nvidia/model.py": "dafb69b36e68c36ba8878c6033e1bc94439526c3d1d9c83edd7c153ad2ba88c8",
     "vllm/config/engram.py": "4c794652d912db2f501b33365484d7c6bf59a26a03f78231c057d3fa09c9ec4b",
+    "vllm/model_executor/layers/quantization/mxfp4.py": "797cf06151ff24d0c9016d9a515d6520a16858837b8f765e3d0690d2b829418a",
+    "vllm/model_executor/layers/fused_moe/oracle/mxfp4.py": "e4920dab4f1d3c6935312270b1a0133e073726903126df8d35c202e53bc0053e",
+    "vllm/model_executor/layers/fused_moe/experts/deep_gemm_moe.py": "16911a64a72eafc26a1bcb544a91f90144d85dc41e3ee57cf20e89925227bbb7",
+    "vllm/model_executor/layers/fused_moe/experts/flashinfer_b12x_moe.py": "15144ce67c19ed9fa0616ac6dde446c2746cf9417a503cd54dca9ac368604525",
+    "vllm/model_executor/layers/fused_moe/b12x.py": "2aa10b8a8220dc27d2e833293d463e7ca8ca3b451ce7c83aeb0231058a26a4b6",
     "flashinfer/experimental/b12x/sequence/engram/_disk.py": "8677201e34dfdf5f69e6a117559bfae50594a6726dcc68cb3830a971830f4be5",
     "flashinfer/experimental/b12x/sequence/_shared/disk_table.py": "601348d52d488057911b5a0b22d36f0e922d80cb956c2658901bee56e63e7c9a",
     "flashinfer/experimental/b12x/loader/_row_plan.h": "58cdf4c8f1ce94d77d75c8caf178cbc468962cd9e4552b579bf04787ab1f2a5c",
-    "flashinfer/experimental/b12x/loader/_ple_reader.c": "36bcce65d3e131a02749a21105eda1771f80ca0e55686f84c576240fa783f585"
+    "flashinfer/experimental/b12x/loader/_ple_reader.c": "36bcce65d3e131a02749a21105eda1771f80ca0e55686f84c576240fa783f585",
+    "vllm/config/scheduler.py": "905c2df6a6814ec8b70c5f5c19394841a6f37c11103c46e0445c4ca0ba0b0afd",
+    "vllm/v1/core/kv_cache_utils.py": "77d6ae740c7679f600fab3caf61c3de370a4303beef76673ef3538b38b4c2ed8",
+    "vllm/v1/metrics/loggers.py": "cebd5c439625db19cdc47634395719421a7fc10407f73926789d583616920d61",
+    "vllm/model_executor/kernels/linear/__init__.py": "4c8917521e5330ae867d53a620b7503a3abd83d703fe9888f56a1e92f30c792d",
+    "vllm/v1/engine/core.py": "17d5a886bbd2800cb375be09b1129f666cc137a4e8fa67b70811c7445884dd53",
+    "vllm/model_executor/models/config.py": "7c275a7d9121b4bfc36631e4d9c235e34a55b1b10cc69a6935cc23c28f232494",
+    "vllm/config/model.py": "5ef88531b4aa8df8af2fefbdc6a9f5a43a9d544357e90f614ed61c61b296a0e1",
+    "vllm/config/cache.py": "011d48cc1258da83ca559bb61ff3daa5cd6a69d0f50a30be5870fc13733736fe",
+    "vllm/config/vllm.py": "a7e678c5d65d14c64db350808e3d979d3643412b7f9d1733e3434703da6afda2"
   },
+  "files_note": "Every file that EMITS a log marker or a metric label the post-boot verifier asserts is pinned here. Without that, a fork that changed a log format could make the verifier pass on a string it invented, or fail for a reason that has nothing to do with the behaviour. The pins below the flashinfer loader are the marker sources: vllm/config/scheduler.py (the chunked-prefill boundary), vllm/v1/core/kv_cache_utils.py (the block-size LCM), vllm/v1/metrics/loggers.py (the cache_config_info metric family), vllm/model_executor/kernels/linear/__init__.py (the dense MXFP8 kernel choice), vllm/v1/engine/core.py and vllm/config/vllm.py (the startup config dump), vllm/model_executor/models/config.py (the TP=3 head padding), vllm/config/model.py (the parallel-config check whose TP=3 relaxation the fork carries), vllm/config/cache.py (the DS-V4.1 block-size constants).",
   "semantic": {
     "flashinfer/experimental/b12x/preparation/artifacts.py": "valid_object must be resolvable (from b12x._lib.cache_integrity) OR the bootstrap shim must be present \u2014 the bootstrap may patch this file in-container, so its hash is deliberately NOT pinned"
+  },
+  "model_contract": {
+    "why": "Facts about the MODEL that the engine reads and that a silent numerical error would hide. The code that consumes them is hash-pinned under `files`; these values pin the inputs.",
+    "text_config.swiglu_limit": 10.0,
+    "text_config.swiglu_limit.why": "The clamped-SwiGLU limit for the routed experts. The chain is: model config -> DeepseekV41Config.swiglu_limit -> the inherited DeepseekV4 MoE class -> RoutedExperts.swiglu_limit -> the MXFP4 quant method -> gemm1_clamp_limit -> the kernel's clamp_limit. If any link stops carrying it, every decode step silently uses unclamped SwiGLU with no error signal."
+  },
+  "resolved_backends": {
+    "why": "What the engine RESOLVES, which is not the same as the flags the recipe passes: the MoE backend, the dense-linear kernel and the attention backend are all selected by the engine's own policy, and a rebase can change them without changing the recipe's command line. The code that resolves them is hash-pinned under `files`; these are the values that resolution must produce. Checked by verify-resolved-backends.py after the engine is up.",
+    "expect": {
+      "moe_backend": "DEEPGEMM_MXFP4",
+      "dense_linear_kernel": "FlashInferCutlassMxfp8LinearKernel",
+      "attention_backend": "b12x",
+      "tp3_head_pad": "heads 64 -> 72, output groups 8 -> 9",
+      "spec_decode": "off",
+      "load_format": "safetensors",
+      "swiglu_limit": 10.0,
+      "scheduler_block_size": 256,
+      "reported_block_size": 128,
+      "requested_block_size": 256,
+      "enable_prefix_caching": "True",
+      "sliding_window": "128",
+      "max_num_batched_tokens": 8192
+    },
+    "expect.why": {
+      "moe_backend": "The MXFP4 experts run through the DeepGEMM FP4 path, which carries the clamped-SwiGLU limit into the kernel.",
+      "attention_backend": "The b12x attention kernels are the ones that run: the DSA indexer and the compressed-sparse MLA kernels are compiled and primed by the b12x autotuner at warmup. The marker is value-bearing, so a different attention backend cannot pass it by accident.",
+      "tp3_head_pad": "The fork's TP=3 head surgery, applied at engine-config time. Upstream vLLM refuses TP=3 for this model (64 attention heads do not divide by 3); the fork pads to 72 heads in 9 output groups instead. This marker proves the surgery is live, and it is emitted by a file the manifest hash-pins.",
+      "scheduler_block_size": "The requested block size; the engine logs the LCM of the KV groups' block sizes.",
+      "requested_block_size": "What the command line ASKED for, read from the container's own argv. The LCM is what the engine resolved and the metric label is the minimum across the KV groups; neither proves the flag was actually forwarded. This is the check that closes that gap.",
+      "reported_block_size": "What /metrics reports for cache_config_info.block_size: the MINIMUM across the prefix-cacheable KV groups, not the requested value. DS-V4.1's sliding-window group is 128, so a 256 request reports 128. Both are asserted because a reader checking only one of them is misled.",
+      "enable_prefix_caching": "On by default in this build, so the sliding-window replay path is live on a request that hits the cache. The long-prompt gate checks that a cache hit does not change the decode logprobs.",
+      "sliding_window": "DS-V4.1's sliding-window size; 128 is what puts the sliding-window group on the 128 block size.",
+      "max_num_batched_tokens": "The chunked-prefill boundary. The long-prompt correctness gate builds a prompt that crosses it, because upstream vLLM #62811 shows the failure lives in the LAST chunk of a chunked prefill when it runs as a piecewise CUDA graph -- a short prompt never reaches it."
+    },
+    "forbidden": {
+      "moe_backend": "'B12X_MXFP4",
+      "moe_backend.why": "The b12x fused-MoE tiny-decode path (one to four tokens per step) computes SwiGLU with no clamp, so the model's 10.0 limit is dropped and every low-batch decode step is quietly wrong. The path is present in the image's flashinfer; it is dormant only because the engine resolves DEEPGEMM_MXFP4. Switching the MoE backend to b12x would turn this on with no error signal, so the check fails loudly instead. The marker is the PREFIX of the quoted MoE enum name: the engine's enum names are B12X_MXFP4_MXFP8 and B12X_MXFP4_BF16, so the prefix covers both. The all-reduce dispatch also lists B12X_PCIE and B12X_ROCENANTE, which are not MoE backends and must not trip this -- hence the prefix is the MoE name and not the bare family name.",
+      "nvfp4_moe_backend": "NvFp4 MoE backend",
+      "nvfp4_moe_backend.why": "The CUTLASS NVFP4 MoE path finalises expert outputs with atomics, so identical requests give different logits on this hardware. It is not the backend this recipe selects."
+    }
   }
 }

@@ -30,7 +30,7 @@ set -euo pipefail
 
 # ---------------------------------------------------------------- image pin
 # DIGEST-pinned to the published manifest of nightly-20261015 (the tag
-# aliases it). A tag can move under us; a digest cannot.
+# aliases it). A tag can move between deployments; a digest cannot.
 #
 # All three boxes must hold this manifest locally. A box whose image was
 # imported rather than pulled can be content-identical yet carry no Hub
@@ -313,60 +313,86 @@ if [ "${DRY_RUN:-0}" = "1" ]; then
   exit 0
 fi
 
-start_probe &
-exec docker run \
-  --name "$CONTAINER_NAME" \
-  ${SECURITY_OPTS} \
-  --network host \
-  --gpus all \
-  --device /dev/infiniband \
-  --ipc host \
-  --ulimit stack=67108864 \
-  --ulimit memlock=-1 \
-  --cap-add IPC_LOCK \
-  -e NODE_RANK="${NODE_RANK:-0}" \
-  -e DIST_MASTER_PORT="$DIST_MASTER_PORT" \
-  -e ROLE="$ROLE" -e NODE_IP="$NODE_IP" -e HEAD_IP="$HEAD_IP" \
-  -e CLUSTER_SIZE="$CLUSTER_SIZE" \
-  -e VLLM_HOST_IP="$NODE_IP" \
-  -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT,GRAPH,TUNING,COLL \
-  -e NCCL_DEBUG_FILE="/tmp/nccl-rank${NODE_RANK:-0}.log" \
-  -e NCCL_NET=IB -e NCCL_IB_DISABLE=0 \
-  -e NCCL_IB_HCA="${NCCL_IB_HCA:?set NCCL_IB_HCA to your RoCE port pair}" \
-  -e NCCL_CROSS_NIC=1 \
-  -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_IB_SUBNET_PREFIX_LEN=24 \
-  -e NCCL_IB_GID_AUTO=1 -e NCCL_IB_MERGE_NICS=0 \
-  -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:?set NCCL_SOCKET_IFNAME to your management interface}" \
-  -e LOAD_FORMAT="$LOAD_FORMAT" \
-  -e ENGRAM_CONFIG="$ENGRAM_CONFIG" \
-  -e KV_CACHE_MEMORY_BYTES="$KV_CACHE_MEMORY_BYTES" \
-  -e BLOCK_SIZE="$BLOCK_SIZE" \
-  -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
-  -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
-  -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
-  -e TOOL_CALL_PARSER="$TOOL_CALL_PARSER" \
-  -e REASONING_PARSER="$REASONING_PARSER" \
-  -e TP_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}" -e GLOO_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}" \
-  -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 \
-  -e NCCL_NVLS_ENABLE=0 -e NCCL_MAX_NCHANNELS="$NCCL_MAX_NCHANNELS" \
-  -e NCCL_BUFFSIZE="$NCCL_BUFFSIZE" -e NCCL_LL128_BUFFSIZE="$NCCL_LL128_BUFFSIZE" -e "NCCL_PROTO=$NCCL_PROTO" \
-  -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ROCE_VERSION_NUM=2 \
-  -e NCCL_NET_GDR_LEVEL=LOC -e NCCL_NET_PLUGIN=none \
-  -e VLLM_ENABLE_ROCE_ALLREDUCE=1 \
-  -e VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB \
-  -e B12X_COMPILE_WORKERS=4 \
-  -e CUTE_DSL_ARCH=sm_121a \
-  -e VLLM_USE_V2_MODEL_RUNNER=1 \
-  -e VLLM_USE_BREAKABLE_CUDAGRAPH=1 \
-  -e VLLM_MXFP8_LM_HEAD=1 \
-  -e VLLM_ENABLE_PCIE_ALLREDUCE=0 \
-  -e PYTHONPYCACHEPREFIX=/tmp/pycache \
-  -e RUNAI_STREAMER_MEMORY_LIMIT=4294967296 \
-  -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
-  -e PORT="$PORT" -e TP="$TP" -e GMU="$GMU" -e CTX="$CTX" -e MNBT="$MNBT" \
-  -e SERVED_NAME="$SERVED_NAME" -e ALIAS_NAME="$ALIAS_NAME" \
-  -e EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS" \
-  -v "$MODEL_DIR:/model:ro" \
-  -v "$KIT_DIR:/kit:ro" \
-  --entrypoint /bin/bash \
+# The container command is built ONCE, into an array. That is what makes the
+# capture mode below honest: there is no second copy of the command that
+# could drift away from the one that actually runs, which is the exact
+# defect class this recipe has already been bitten by (knobs read but never
+# forwarded). A reader can check that every value in the profile reached the
+# container by reading the printed command, and that command IS the command.
+run_args=(
+  --name "$CONTAINER_NAME"
+  ${SECURITY_OPTS}
+  --network host
+  --gpus all
+  --device /dev/infiniband
+  --ipc host
+  --ulimit stack=67108864
+  --ulimit memlock=-1
+  --cap-add IPC_LOCK
+  -e NODE_RANK="${NODE_RANK:-0}"
+  -e DIST_MASTER_PORT="$DIST_MASTER_PORT"
+  -e ROLE="$ROLE" -e NODE_IP="$NODE_IP" -e HEAD_IP="$HEAD_IP"
+  -e CLUSTER_SIZE="$CLUSTER_SIZE"
+  -e VLLM_HOST_IP="$NODE_IP"
+  -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT,GRAPH,TUNING,COLL
+  -e NCCL_DEBUG_FILE="/tmp/nccl-rank${NODE_RANK:-0}.log"
+  -e NCCL_NET=IB -e NCCL_IB_DISABLE=0
+  -e NCCL_IB_HCA="${NCCL_IB_HCA:?set NCCL_IB_HCA to your RoCE port pair}"
+  -e NCCL_CROSS_NIC=1
+  -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_IB_SUBNET_PREFIX_LEN=24
+  -e NCCL_IB_GID_AUTO=1 -e NCCL_IB_MERGE_NICS=0
+  -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:?set NCCL_SOCKET_IFNAME to your management interface}"
+  -e LOAD_FORMAT="$LOAD_FORMAT"
+  -e ENGRAM_CONFIG="$ENGRAM_CONFIG"
+  -e KV_CACHE_MEMORY_BYTES="$KV_CACHE_MEMORY_BYTES"
+  -e BLOCK_SIZE="$BLOCK_SIZE"
+  -e MAX_NUM_SEQS="$MAX_NUM_SEQS"
+  -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS"
+  -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME"
+  -e TOOL_CALL_PARSER="$TOOL_CALL_PARSER"
+  -e REASONING_PARSER="$REASONING_PARSER"
+  -e TP_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}" -e GLOO_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}"
+  -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1
+  -e NCCL_NVLS_ENABLE=0 -e NCCL_MAX_NCHANNELS="$NCCL_MAX_NCHANNELS"
+  -e NCCL_BUFFSIZE="$NCCL_BUFFSIZE" -e NCCL_LL128_BUFFSIZE="$NCCL_LL128_BUFFSIZE" -e "NCCL_PROTO=$NCCL_PROTO"
+  -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ROCE_VERSION_NUM=2
+  -e NCCL_NET_GDR_LEVEL=LOC -e NCCL_NET_PLUGIN=none
+  -e VLLM_ENABLE_ROCE_ALLREDUCE=1
+  -e VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB
+  -e B12X_COMPILE_WORKERS=4
+  -e CUTE_DSL_ARCH=sm_121a
+  -e VLLM_USE_V2_MODEL_RUNNER=1
+  -e VLLM_USE_BREAKABLE_CUDAGRAPH=1
+  -e VLLM_MXFP8_LM_HEAD=1
+  -e VLLM_ENABLE_PCIE_ALLREDUCE=0
+  -e PYTHONPYCACHEPREFIX=/tmp/pycache
+  -e RUNAI_STREAMER_MEMORY_LIMIT=4294967296
+  -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"
+  -e PORT="$PORT" -e TP="$TP" -e GMU="$GMU" -e CTX="$CTX" -e MNBT="$MNBT"
+  -e SERVED_NAME="$SERVED_NAME" -e ALIAS_NAME="$ALIAS_NAME"
+  -e EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS"
+  -v "$MODEL_DIR:/model:ro"
+  -v "$KIT_DIR:/kit:ro"
+  --entrypoint /bin/bash
   "$IMAGE" -euo pipefail -c "$BOOTSTRAP"
+)
+
+# PRINT_CMD=1 prints the container command and stops. No container is
+# started, no GPU is touched, and the recipe's own pre-boot assertions still
+# run first — so the printed command is one that would actually have been
+# accepted. This is how a reader checks that every value in the profile
+# reached the container.
+if [ "${PRINT_CMD:-0}" = "1" ]; then
+  echo "[ds41-fork] PRINT_CMD — the container command, one argument per line:"
+  printf '%s\n' docker run
+  printf '%s\n' "${run_args[@]}"
+  echo
+  echo "[ds41-fork] PRINT_CMD — the same command as one line:"
+  printf '%q ' docker run "${run_args[@]}"
+  printf '\n'
+  echo "[ds41-fork] PRINT_CMD — container NOT started"
+  exit 0
+fi
+
+start_probe &
+exec docker run "${run_args[@]}"
