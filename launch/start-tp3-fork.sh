@@ -88,13 +88,46 @@ PORT="${PORT:-8600}"
 TP="${TP:-3}"
 GMU="${GMU:-0.85}"                        # the eugr recipe's proven budget
 CTX="${CTX:-524288}"                      # 512K, validated; the KV pool is boot-labile (~1.6-2.4M tokens) — do NOT lower without a new boot result
-MNBT="${MNBT:-${MAX_NUM_BATCHED_TOKENS:-8192}}"                      # chunked-prefill batch width. 16384 REJECTED (worker OOM during compile at gmu 0.85); 8192 is the proven posture. Retest only with a memory plan
+MNBT="${MNBT:-${MAX_NUM_BATCHED_TOKENS:-8192}}"   # chunked-prefill batch width. 16384 REJECTED (worker OOM during compile at gmu 0.85); 8192 is the proven posture. Retest only with a memory plan
+LOAD_FORMAT="${LOAD_FORMAT:-safetensors}"
+# The engram default is assigned in TWO steps, never inline in ${VAR:-...}.
+# A brace inside a parameter-expansion default makes bash terminate the
+# expansion early once the variable IS set, which silently appended a stray
+# "}" to the JSON — the value was only correct when nothing set it. A
+# single-quoted literal has no escapes and no scanner ambiguity.
+ENGRAM_CONFIG="${ENGRAM_CONFIG:-}"
+if [ -z "$ENGRAM_CONFIG" ]; then
+  ENGRAM_CONFIG='{"cpu_offload":false,"table_memory":"disk"}'
+fi
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-4g}"
+BLOCK_SIZE="${BLOCK_SIZE:-256}"
+MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
+# The served name: the profile's knob wins, and ALIAS_NAME stays a working
+# alias when the profile does not set one. Resolved ONCE here, because a
+# two-variable fallback inside the serve line lets one of them shadow the
+# other for good. ALIAS_NAME is read BEFORE its own default is applied.
+ALIAS_NAME="${ALIAS_NAME:-main}"
+SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${ALIAS_NAME:-main}}"
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-deepseek_v41}"
+REASONING_PARSER="${REASONING_PARSER:-deepseek_v41}"
 DIST_MASTER_PORT="${DIST_MASTER_PORT:-25000}"
 SERVED_NAME="${SERVED_NAME:-deepseek-v4.1-flash}"
-ALIAS_NAME="${ALIAS_NAME:-main}"
 MODEL_DIR="${MODEL_DIR:-$HOME/models/deepseek-v4.1-flash-1017-1bae0e10}"
 CONTAINER_NAME="${CONTAINER_NAME:-ds41-flash-tp3}"
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-}"
+# Fabric selectors — site-specific; fill them in before booting. The guard
+# below refuses a boot while a placeholder is still in place.
+NCCL_IB_HCA="${NCCL_IB_HCA:-EDIT_ME_ROCE_PORT_PAIR}"
+NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-EDIT_ME_MGMT_IF}"
+SECURITY_OPTS="${SECURITY_OPTS:---security-opt seccomp=unconfined}"
+# The NCCL caps and the allocator setting are knobs too — the shipped
+# values are the proven posture, but a profile may want to change them.
+NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-1048576}"
+NCCL_LL128_BUFFSIZE="${NCCL_LL128_BUFFSIZE:-262144}"
+NCCL_PROTO="${NCCL_PROTO:-^LL128}"
+NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 KIT_DIR="$(cd "$(dirname "$0")/tp3-kit" && pwd)"
 
 [[ -d "$MODEL_DIR" ]] || { echo "model not staged: $MODEL_DIR" >&2; exit 1; }
@@ -112,6 +145,13 @@ esac
 # ---------------------------------------------------------------- bootstrap
 read -r -d '' BOOTSTRAP <<'EOF' || true
 set -euo pipefail
+# The host always forwards ENGRAM_CONFIG; this is the belt-and-braces
+# default for a hand-run bootstrap. Assigned in two steps for the same
+# reason as the host side: a brace inside a ${VAR:-...} default is not
+# safe to expand.
+if [ -z "${ENGRAM_CONFIG:-}" ]; then
+  ENGRAM_CONFIG='{"cpu_offload":false,"table_memory":"disk"}'
+fi
 # nightly-20261015 ships a broken pair: preparation/artifacts.py imports
 # valid_object from b12x._lib.cache_integrity, which no longer defines it.
 # Patch it in-container before anything imports vllm: local shim, always
@@ -141,7 +181,7 @@ else
 fi
 exec vllm serve /model \
   --load-format "${LOAD_FORMAT:-safetensors}" \
-  --engram-config "${ENGRAM_CONFIG:-{\"cpu_offload\":false,\"table_memory\":\"disk\"}}" \
+  --engram-config "${ENGRAM_CONFIG}" \
   --tensor-parallel-size "${TP:-3}" \
   --distributed-executor-backend mp \
   --nnodes "${CLUSTER_SIZE:-3}" \
@@ -152,7 +192,7 @@ exec vllm serve /model \
   --max-model-len "${CTX}" \
   --gpu-memory-utilization "${GMU:-0.85}" \
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-4g}" \
-  --served-model-name "${ALIAS_NAME:-${SERVED_MODEL_NAME:-main}}" \
+  --served-model-name "${SERVED_MODEL_NAME:-main}" \
   --port "${PORT:-8600}" \
   --block-size "${BLOCK_SIZE:-256}" \
   --max-num-seqs "${MAX_NUM_SEQS:-8}" \
@@ -176,20 +216,49 @@ PROBE_OUT="${PROBE_OUT:-/tmp/ds41-boot-probe.txt}"
 PROBE_INTERVAL="${PROBE_INTERVAL:-5}"
 PROBE_MAX_SECONDS="${PROBE_MAX_SECONDS:-2700}"
 
+# MemAvailable is NOT a usable signal on these boxes: it is reported as 0
+# while MemFree is ~3 GiB, with no memory pressure, no cgroup limit and no
+# dirty page cache. The engine's own engram budget check compares against
+# that number, which is why it "cannot see" the headroom. So the probe
+# measures what the kernel can actually HAND OUT:
+#     reclaimable = MemFree + SReclaimable + (Active(file)+Inactive(file) - Unevictable)
+# and keeps the minimum across the boot.
+sample_memory() {
+  awk '
+    /^MemFree:/          {free=$2}
+    /^MemAvailable:/     {avail=$2}
+    /^SReclaimable:/     {srec=$2}
+    /^Active\(file\):/    {af=$2}
+    /^Inactive\(file\):/  {inf=$2}
+    /^Unevictable:/      {unev=$2}
+    END {
+      rf = af + inf - unev; if (rf < 0) rf = 0;
+      head = free + srec + rf;
+      printf "%d %d %d\n", head, avail, free;
+    }' /proc/meminfo 2>/dev/null
+}
+
 start_probe() {
-  local start=$SECONDS min_kb=0 seen=0 status="" avail="" verdict="UNKNOWN" detail="container never reached a terminal state"
+  local start=$SECONDS min_kb=0 min_avail_kb=0 min_free_kb=0 seen=0 status="" mem="" head_kb="" avail_kb="" free_kb="" rest=""
+  local have_min=0 have_avail=0 have_free=0
+  local verdict="UNKNOWN" detail="container never reached a terminal state"
   : > "$PROBE_OUT"
   while [ $((SECONDS - start)) -lt "$PROBE_MAX_SECONDS" ]; do
     status="$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || true)"
     case "$status" in
       exited|dead|removing) break ;;
     esac
-    avail="$(awk '/^MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null || true)"
-    if [ -n "$avail" ]; then
-      if [ "$min_kb" -eq 0 ] || [ "$avail" -lt "$min_kb" ]; then min_kb=$avail; fi
+    mem="$(sample_memory || true)"
+    if [ -n "$mem" ]; then
+      head_kb="${mem%% *}"; rest="${mem#* }"
+      avail_kb="${rest%% *}"; free_kb="${rest##* }"
+      if [ "$have_min" -eq 0 ] || [ "$head_kb" -lt "$min_kb" ]; then min_kb=$head_kb; have_min=1; fi
+      if [ "$have_avail" -eq 0 ] || [ "$avail_kb" -lt "$min_avail_kb" ]; then min_avail_kb=$avail_kb; have_avail=1; fi
+      if [ "$have_free" -eq 0 ] || [ "$free_kb" -lt "$min_free_kb" ]; then min_free_kb=$free_kb; have_free=1; fi
       seen=$((seen + 1))
       if [ $((seen % 12)) -eq 1 ]; then
-        printf 'RAM-PROBE avail_kb=%s min_kb=%s t=%ss\n' "$avail" "$min_kb" "$((SECONDS - start))"
+        printf 'RAM-PROBE reclaimable_kb=%s min_reclaimable_kb=%s memavailable_kb=%s min_memavailable_kb=%s t=%ss\n' \
+          "$head_kb" "$min_kb" "$avail_kb" "$min_avail_kb" "$((SECONDS - start))"
       fi
     fi
     sleep "$PROBE_INTERVAL"
@@ -207,10 +276,28 @@ start_probe() {
       verdict="FAIL"; detail="no 'Application startup complete' in the container log"
     fi
   fi
-  printf 'RAM-PROBE FINAL min_available_kb=%s samples=%s elapsed=%ss\n' "$min_kb" "$seen" "$((SECONDS - start))"
+  # The headroom gate: the engram scale plane needs roughly 1.9 GiB per
+  # rank of host memory. The gate compares that against the MINIMUM
+  # reclaimable headroom observed across the whole boot. The KV pool is
+  # deliberately NOT part of this trade -- a pool cut is a concurrency cut,
+  # and the measurement says the headroom is there without it.
+  local plane_kb="${PLANE_REQUIRED_MIB:-1960}"
+  local headroom_mib=$(( min_kb / 1024 ))
+  local plane_gate="n/a"
+  if [ "$have_min" -eq 1 ]; then
+    if [ "$min_kb" -ge $((plane_kb * 1024)) ]; then plane_gate="PASS"; else plane_gate="FAIL"; fi
+  fi
+  printf 'RAM-PROBE FINAL min_reclaimable_kb=%s min_reclaimable_mib=%s min_memavailable_kb=%s min_memfree_kb=%s samples=%s elapsed=%ss\n' \
+    "$min_kb" "$headroom_mib" "$min_avail_kb" "$min_free_kb" "$seen" "$((SECONDS - start))"
+  printf 'HEADROOM GATE: %s (min reclaimable %s MiB vs plane %s MiB)\n' "$plane_gate" "$headroom_mib" "$plane_kb"
   printf 'BOOT RESULT: %s (%s)\n' "$verdict" "$detail"
   {
-    printf 'min_available_kb=%s\n' "$min_kb"
+    printf 'min_reclaimable_kb=%s\n' "$min_kb"
+    printf 'min_reclaimable_mib=%s\n' "$headroom_mib"
+    printf 'min_memavailable_kb=%s\n' "$min_avail_kb"
+    printf 'min_memfree_kb=%s\n' "$min_free_kb"
+    printf 'plane_required_mib=%s\n' "$plane_kb"
+    printf 'headroom_gate=%s\n' "$plane_gate"
     printf 'samples=%s\n' "$seen"
     printf 'elapsed_s=%s\n' "$((SECONDS - start))"
     printf 'result=%s\n' "$verdict"
@@ -229,7 +316,7 @@ fi
 start_probe &
 exec docker run \
   --name "$CONTAINER_NAME" \
-  ${SECURITY_OPTS:---security-opt seccomp=unconfined} \
+  ${SECURITY_OPTS} \
   --network host \
   --gpus all \
   --device /dev/infiniband \
@@ -250,10 +337,19 @@ exec docker run \
   -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_IB_SUBNET_PREFIX_LEN=24 \
   -e NCCL_IB_GID_AUTO=1 -e NCCL_IB_MERGE_NICS=0 \
   -e NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:?set NCCL_SOCKET_IFNAME to your management interface}" \
+  -e LOAD_FORMAT="$LOAD_FORMAT" \
+  -e ENGRAM_CONFIG="$ENGRAM_CONFIG" \
+  -e KV_CACHE_MEMORY_BYTES="$KV_CACHE_MEMORY_BYTES" \
+  -e BLOCK_SIZE="$BLOCK_SIZE" \
+  -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
+  -e MAX_NUM_BATCHED_TOKENS="$MAX_NUM_BATCHED_TOKENS" \
+  -e SERVED_MODEL_NAME="$SERVED_MODEL_NAME" \
+  -e TOOL_CALL_PARSER="$TOOL_CALL_PARSER" \
+  -e REASONING_PARSER="$REASONING_PARSER" \
   -e TP_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}" -e GLOO_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME}" \
   -e NCCL_CUMEM_ENABLE=0 -e NCCL_IGNORE_CPU_AFFINITY=1 \
-  -e NCCL_NVLS_ENABLE=0 -e NCCL_MAX_NCHANNELS=8 \
-  -e NCCL_BUFFSIZE=1048576 -e NCCL_LL128_BUFFSIZE=262144 -e "NCCL_PROTO=^LL128" \
+  -e NCCL_NVLS_ENABLE=0 -e NCCL_MAX_NCHANNELS="$NCCL_MAX_NCHANNELS" \
+  -e NCCL_BUFFSIZE="$NCCL_BUFFSIZE" -e NCCL_LL128_BUFFSIZE="$NCCL_LL128_BUFFSIZE" -e "NCCL_PROTO=$NCCL_PROTO" \
   -e NCCL_IB_ADDR_FAMILY=AF_INET -e NCCL_IB_ROCE_VERSION_NUM=2 \
   -e NCCL_NET_GDR_LEVEL=LOC -e NCCL_NET_PLUGIN=none \
   -e VLLM_ENABLE_ROCE_ALLREDUCE=1 \
@@ -266,7 +362,7 @@ exec docker run \
   -e VLLM_ENABLE_PCIE_ALLREDUCE=0 \
   -e PYTHONPYCACHEPREFIX=/tmp/pycache \
   -e RUNAI_STREAMER_MEMORY_LIMIT=4294967296 \
-  -e PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False \
+  -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF" \
   -e PORT="$PORT" -e TP="$TP" -e GMU="$GMU" -e CTX="$CTX" -e MNBT="$MNBT" \
   -e SERVED_NAME="$SERVED_NAME" -e ALIAS_NAME="$ALIAS_NAME" \
   -e EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS" \

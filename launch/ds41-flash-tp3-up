@@ -42,17 +42,6 @@ ALL_BOXES=("$SPARK_HEAD" "$SPARK_A" "$SPARK_B")
 CONTAINER_NAME="${CONTAINER_NAME:-ds41-flash-tp3}"
 REMOTE_DIR="${REMOTE_DIR:-ds41-flash-tp3}"       # landing dir on each box
 
-# Resolve cluster.env ONCE, here, so every value below is a local
-# expansion. A value that is resolved on the box instead would silently
-# expand to empty there — that is the bug class this layout avoids.
-load_env() {
-  [ -r "$ENV_SRC" ] || die "cannot read $ENV_SRC"
-  set -a
-  # shellcheck disable=SC1090
-  . "$ENV_SRC"
-  set +a
-}
-
 # ---------------------------------------------------------------- preflight
 do_preflight() {
   say "preflight: verifying image, checkpoint, fabric on all boxes"

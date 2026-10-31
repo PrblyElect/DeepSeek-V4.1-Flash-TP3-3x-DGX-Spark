@@ -306,10 +306,11 @@ the headroom as a budget to measure, not a constant:
 - the bring-up drops the page cache before the load, which is what
   keeps the staging path from colliding with the loader;
 - the loader's own gate compares its configured budget against
-  *available* memory, so it cannot see a plane the kernel will not
-  hand out — the boot probe samples the minimum available memory
-  across the whole boot and prints it, so a thin run is visible in the
-  log instead of at the first request;
+  *available* memory, which on this unified-memory kernel can read as
+  zero even when memory is available — the boot probe therefore samples
+  the minimum **reclaimable** headroom (free + reclaimable slab +
+  reclaimable page cache) across the whole boot and prints it, so a thin
+  run is visible in the log instead of at the first request;
 - if a boot is killed, the kernel log says so (`journalctl -k | grep
   -i "killed process"`), and the fix is to free page cache before the
   load rather than to lower gmu.
