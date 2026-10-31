@@ -18,7 +18,7 @@ DGX Sparks on a 200G CX-7 RoCE triangle, using the eugr b12x vLLM fork
 on a public Docker Hub image. Capacity-optimized: a **~2M-token KV
 pool** at **512K context** — the pool is boot-labile, landing between
 roughly 1.6M and 2.4M tokens depending on the boot — for **~6–9×
-concurrency** at 262K and **~3–4.5×** at 512K. ~29 tok/s single-stream
+concurrency** at 262K and **~3–4.7×** at 512K. ~29 tok/s single-stream
 (prose, no spec decode). Engram n-gram tables are served from NVMe,
 freeing 31 GiB/rank of host memory that would otherwise be consumed.
 The bring-up maps every memory trap on GB10 unified memory: NCCL buffer
@@ -32,12 +32,12 @@ target TP4 with a 4th box. This one is three commands with a pre-built
 image. The field moves fast — check the community indexes before
 repeating the "only" claim.
 
-As far as we can find: this is the first TP=3 vLLM serving of
-V4.1-Flash on the eugr b12x lineage, and the first recipe of any engine
-to prioritize KV capacity and context length over throughput on this
-hardware (the trade is documented below). The speed-optimized SGLang
-recipe from the community achieves higher tok/s but at half the KV
-capacity and half the context — see **Comparison** below.
+As far as is documented: this is the first TP=3 vLLM serving of
+V4.1-Flash on the eugr b12x lineage, and the first **three-node TP=3**
+recipe on this lineage to prioritize KV capacity and context length over
+throughput (the trade is documented below). The speed-optimized SGLang
+recipe from the community achieves higher tok/s but at about a third of
+the KV capacity and half the context — see **Comparison** below.
 
 Prerequisites: three DGX Sparks wired as a full CX-7 RoCE triangle (one
 /24 per leg, MTU 9000) plus a management LAN, the ~510 GB checkpoint
@@ -83,6 +83,38 @@ reading before you run anything: `launch/start-tp3-fork.sh` (what
 actually boots a box) and `launch/tp3-kit/engine-identity.json` (what
 the boot is allowed to execute).
 
+### Reading the container command without starting it
+
+`PRINT_CMD=1` prints the `docker run` command the launcher would run
+and exits. No container is started, no GPU is touched, and the recipe's
+own pre-boot assertions still run first — so what you read is a command
+that would actually have been accepted.
+
+Run it on the box you are about to start, in the staged directory, with
+the profile exported first — the launcher reads its values from the
+environment, and `config/cluster.env` is where they live:
+
+```sh
+cd ~/ds41-flash-tp3
+set -a; . config/cluster.env; set +a
+NODE_IP=192.168.0.10 NODE_RANK=0 ROLE=head PRINT_CMD=1 bash start-tp3-fork.sh
+```
+
+(`NODE_IP` is this box's own address, `NODE_RANK` its rank, `ROLE` its
+role — the same values `ds41-flash-tp3-up start` sets. The placeholders
+in `config/cluster.env` must already be filled in: the pre-boot
+assertions reject an unset fabric, an unstaged model and an unpinned
+image, which is why the printed command is one that would really have
+been accepted.)
+
+It prints the command one argument per line, and then again as a single
+copy-pasteable line.
+
+This is how you check that every value in `config/cluster.env` reached
+the container. A knob that is read but never forwarded shows up here as
+the engine's default where you expected your value — which is exactly
+the defect class this recipe has already been bitten by.
+
 ## Served numbers
 
 Measured at the shipped configuration (gmu 0.85, 4 GiB KV, 512K context,
@@ -96,9 +128,9 @@ no spec decode, engram on NVMe):
 | KV pool | **~2M tokens** (boot-labile: ~1.6–2.4M) |
 | Context length | **524,288 (512K)** |
 | Concurrency at 262K ctx | **~6–9×** |
-| Concurrency at 512K ctx | **~3–4.5×** |
+| Concurrency at 512K ctx | **~3–4.7×** |
 | Cold boot (load→health) | ~12 min (200 s load) |
-| Temp-0 determinism | identical across runs |
+| Temp-0 determinism | identical across runs — short prompts (gate 2). The long-prompt path is a separate gate (9) and is not covered by gate 2. |
 | Tool calling (deepseek_v41) | working |
 | Reasoning parser (deepseek_v41) | working |
 
@@ -112,9 +144,9 @@ the capacity** — at ~29 tok/s.
 For workloads that are context-bound (RAG with large knowledge bases,
 long legal or research documents, multi-turn conversations with massive
 history), the KV pool and context length are the binding constraints,
-not generation speed. A ~200K-token prompt that overflows a 262K context
-costs you the entire request; a 22 tok/s difference in generation speed
-is invisible when streaming at reading speed.
+not generation speed. A 300K-token document is rejected outright at a
+262K context; a 22 tok/s difference in generation speed is invisible when
+streaming at reading speed.
 
 The trade-off table:
 
@@ -122,7 +154,7 @@ The trade-off table:
 |---|---|---|
 | KV pool | **~2M tokens** | 750K tokens |
 | Context | **512K** | 262K |
-| Concurrency @ 262K | **~6–9×** | ~2.9× |
+| Concurrency @ 262K | **~6–9×** | ~2.9× (derived) |
 | Speed | 29 tok/s | **51 tok/s** |
 | Spec decode | off (capacity) | on (speed) |
 | Engine | vLLM (eugr b12x) | SGLang (custom) |
@@ -149,12 +181,14 @@ NCCL_MAX_NCHANNELS=8
 This cut the pinned footprint from 4.7 GiB to 139 MiB per node —
 freeing enough memory for the head node to boot.
 
-### 2. Engram tables stage 31 GiB per rank in host memory
+### 2. Engram tables stage ~31 GiB per rank in host memory
 
 V4.1-Flash ships with a 196B-parameter engram (n-gram conditional
-memory) block. Without explicit configuration, the loader stages the
-engram tables into host memory — consuming ~31 GiB per rank on a 121 GiB
-box that already holds 95 GiB of weights. Fix:
+memory) block: two ~94.5 GiB table shards, ~189 GiB in all, of which
+each rank reads its ~63 GiB share from its node's local NVMe. Without
+explicit configuration, the loader stages a large part of each rank's
+rows into host memory — ~31 GiB per rank — on a 121 GiB box that already
+holds 95 GiB of weights. Fix:
 
 ```sh
 --engram-config '{"cpu_offload":false,"table_memory":"disk"}'
@@ -278,6 +312,88 @@ It is a capacity figure, not a promise about simultaneous streams: the
 shipped `--max-num-seqs 8` caps how many requests are served at once, so
 the higher end of the 262K band describes pool depth, not concurrency.
 
+### `BLOCK_SIZE=256` — what it is, and what `/metrics` will say
+
+`BLOCK_SIZE=256` is not a free parameter: it is the block size the
+DeepSeek-V4.1 sparse-SWA attention backend reports as its **preferred**
+size on this hardware (`get_preferred_block_size() -> 256`; the engine's
+own default is 16). Setting it explicitly pins the value against a future
+backend that might prefer something else.
+
+The value the engine *reports* is a different number, and the difference
+is not a mistake:
+
+- the engine logs `kv lcm block sizes 256` — the scheduler block size is
+  the LCM of the KV groups' block sizes;
+- `/metrics` reports `cache_config_info.block_size = 128`, because that
+  field is the **minimum** across the prefix-cacheable KV groups, and
+  DeepSeek-V4.1's sliding-window group is 128.
+
+So `128` in the metrics is the sliding-window group's size, not the
+requested size, and not an indication that the knob was ignored. The
+acceptance gate checks all three numbers — the requested value (read from
+the container's own environment, where the launcher forwards it), the LCM
+the engine logs, and the metric label (see gate 8's kit).
+
+The requested value cannot be read from the container's command line
+alone, and the reason is worth stating: the serve line is a shell string,
+so the command line holds the literal text `--block-size
+"${BLOCK_SIZE:-256}"`, and bash expands it *inside* the container when the
+bootstrap runs. That text is identical for every value the operator could
+set, so matching it would assert nothing. The gate reads
+`BLOCK_SIZE` from the container's environment instead — the launcher
+forwards it with `-e BLOCK_SIZE="$BLOCK_SIZE"` — and falls back to the
+command line only when it carries a *literal* number, which is what the
+value is when a launcher bakes it in.
+
+### What the engine actually resolves
+
+The command line is not the behaviour. The MoE backend, the dense-linear
+kernel and the attention backend are all chosen by the engine's own
+policy, and a newer image can change them without changing a flag you
+pass. On this configuration the engine resolves:
+
+| | resolved to |
+|---|---|
+| MoE backend | `DEEPGEMM_MXFP4` (the MXFP4 experts) |
+| dense linear | `FlashInferCutlassMxfp8LinearKernel` |
+| attention | b12x (DSA indexer) |
+| TP=3 head padding | 64 heads → 72, in 9 output groups |
+| speculative decode | off |
+| load format | `safetensors` |
+
+Two of those are load-bearing and are checked, not assumed:
+
+- the MoE backend must **not** be the b12x one — that path computes
+  SwiGLU with no clamp on the small-batch decode step, so the model's
+  clamped-SwiGLU limit would be silently dropped, with no error signal;
+- the model's clamped-SwiGLU limit must still be what the engine
+  resolves, because the chain that carries it from the config to the
+  kernel is several layers deep.
+
+Gate 8 checks all of that, along with the rest of the contract. Each
+expectation is read from the engine's own startup log, its own `/metrics`
+and its own resolved config; a missing marker is a failure, not a skip.
+Every file that prints one of those markers is hash-pinned in the
+engine-identity manifest, so a newer image cannot change what a marker
+says without the gate noticing.
+
+### Re-audit triggers
+
+- **A new upstream image.** The engine-identity gate refuses any image
+  whose build stamp or engine-critical file hashes differ. That is the
+  adoption gate: re-audit, then re-pin.
+- **A rebase that touches TP=3.** Upstream vLLM rejects TP=3 for this
+  model outright — 64 attention heads do not divide by 3 — so the
+  head-padding this recipe depends on is a fork-local mechanism, not an
+  upstream one, and an upstream change to the parallel-config checks or
+  to this model's attention code can silently break it.
+- **A 3-node TP mesh is an off-the-recommended shape.** Multi-node TP on
+  DGX Spark has a documented upstream failure mode where the ranks sit in
+  a collective that never completes, with no NCCL error and the nodes
+  drawing idle power (upstream vLLM issue #46097, reported on a 4× Spark
+  mesh). It is worth knowing before you debug a hang.
+
 ## Hardware
 
 Three NVIDIA DGX Spark (GB10, 121.69 GiB unified CPU/GPU memory each),
@@ -318,12 +434,12 @@ the headroom as a budget to measure, not a constant:
 
 ## Engram on NVMe
 
-The two 101 GiB engram n-gram table shards (~203 GiB total) remain on
-each node's local NVMe. They are referenced by the model's index but
-are never loaded into host or GPU memory — the `table_memory:disk`
-setting instructs the engine to read rows on demand during inference.
-This is the same approach described in the community SGLang recipe and
-the openzaka TP4 deployment guide.
+The two ~94.5 GiB engram n-gram table shards (~189 GiB total, i.e.
+~203 GB) remain on each node's local NVMe. They are referenced by the
+model's index but are never loaded into host or GPU memory — the
+`table_memory:disk` setting instructs the engine to read rows on demand
+during inference. This is the same approach the community SGLang recipe
+describes.
 
 ## Speculative decode: tested and rejected
 
@@ -332,18 +448,31 @@ grounds. The draft model adds ~3 GiB per rank, which at TP3 leaves
 insufficient memory for the KV pool and CUDA graphs — the boot OOMs at
 every gmu and KV combination tried (0.83/0.85 × 1g/2g). The trade:
 ~51 tok/s (community SGLang number with spec decode) vs 29 tok/s, at
-the cost of halving the KV pool and context. For context-bound
+the cost of the KV pool and the context length — the draft model does
+not fit beside this pool. (That is a trade against *this* recipe's own
+capacity with spec decode off; against the community's 750K pool this
+recipe still carries more than double.) For context-bound
 workloads, the capacity is worth more than the speed.
 
 ## Comparison with other V4.1-Flash recipes
 
+Every figure in the other rows is **other people's published number**,
+read from the repository linked in that row — not measured here, and not
+comparable cell for cell: the checkpoint, the weight format, the engine
+and the transport all differ. They are here to show the shape of the
+landscape, not to claim a win.
+
 | Recipe | Engine | TP | Image | KV pool | Context |
 |---|---|---|---|---|---|
-| **This one** | vLLM (eugr b12x) | **3** | **public Docker Hub** | **~2M** | **512K** |
-| MiaAI-Lab | SGLang | 3 | custom build | 750K | 262K |
-| christopherowen/spark-ds41f | vLLM (custom fork) | 3 | build from source | ~800K | 512K |
-| tonyd2wild | vLLM (patched nightly) | 2/4 | patched | varies | varies |
-| openzaka | vLLM | 4 | custom | — | 300K |
+| **This one** | vLLM (b12x fork), native weights | **3** | **public Docker Hub, digest-pinned** | **~2M tokens** | **512K** |
+| [MiaAI-Lab](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks) | SGLang | 3 (a 4-node line too) | SGLang base pinned by digest + a local overlay | 750K tokens (TP3) | 256K limit (TP3) |
+| [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f) | vLLM (custom fork) | 3 or 4 | built from the repo; one image serves every shape | 1.3M–5.5M (TP3) – 11.6M (TP4) tokens | 256K (TP3, 4k) / 1M (TP3, TP4) |
+| [tonyd2wild](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-TP2-and-TP4-DGX-Sparks) | TensorFold (a Zig engine); older vLLM lanes | 2 or 4 | engine built from source | 1.05M (TP2) – 29M positions | 300K – 1M |
+
+Two things this recipe does differently from all of them: the engine
+image is **public** — pull it by digest and the boot is reproducible —
+and the shape is three nodes on a RoCE triangle rather than a
+switchless ring of four.
 
 ## Credits
 
@@ -352,9 +481,8 @@ workloads, the capacity is worth more than the speed.
 - The MiaAI-Lab recipe for the SGLang comparison numbers and the NCCL
   buffer tuning discovery (their documentation of the 4.7 GiB → 139 MiB
   fix was the key that unlocked the head node)
-- The upstream B12X image authors for the `--load-format safetensors`
-  path, which avoids the pinned-bounce-buffer OOM
-- The openzaka TP4 deployment whitepaper for the engram-on-disk pattern
+- The upstream vLLM `safetensors` loader path, which avoids the
+  pinned-bounce-buffer OOM the b12x loader hits on a busy head node
 
 ## License
 

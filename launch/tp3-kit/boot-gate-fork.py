@@ -8,7 +8,7 @@ gate proves the model dir is the ORIGINAL pull before the engine starts:
 48 shards at root (engram included), the 12 engram index entries PRESENT,
 config untouched (heads 64, vocab 129280, engram_layer_ids [1,14]).
 
-It ALSO proves the ENGINE is the build we audited (engine-identity.json):
+It ALSO proves the ENGINE is the audited build (engine-identity.json):
 the image is patched at runtime by the bootstrap (the valid_object shim),
 so a manifest digest alone cannot say what is executing. The build stamp
 and the engine-critical file hashes can. A new eugr nightly therefore
@@ -131,6 +131,22 @@ else:
                for k, v in stamp.get("expect", {}).items() if vals.get(k) != v]
         check(not bad, "build stamp matches (vllm/flashinfer/build commits)"
               + ("" if not bad else " — " + "; ".join(bad)))
+
+    # The MODEL contract: values the engine reads out of the checkpoint.
+    # The code that consumes them is pinned by hash above, so this pins the
+    # inputs. A silent numerical error (an activation limit that stops
+    # being carried to the kernel) would otherwise show up as plausible
+    # output and nothing else.
+    for dotted, want in spec.get("model_contract", {}).items():
+        if dotted == "why" or dotted.endswith(".why"):
+            continue
+        node = cfg
+        for part in dotted.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+            if node is None:
+                break
+        check(node == want, f"model contract {dotted} == {want!r}"
+              + ("" if node == want else f" — got {node!r}"))
 
     for rel, want in spec.get("files", {}).items():
         p = os.path.join(DIST, rel)

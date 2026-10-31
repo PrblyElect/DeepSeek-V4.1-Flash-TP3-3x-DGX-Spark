@@ -2,6 +2,25 @@
 
 Acceptance gates for the shipped configuration. Run after every boot.
 
+**Where each gate runs.** Gates 1–5 and gate 9 are plain HTTP and run
+from anywhere that can reach the head box. Gates 6–8 shell out to the
+local `docker` binary and must run **on the head box**, in the staged
+directory (`~/ds41-flash-tp3/`), where the container actually lives:
+
+```sh
+ssh HEAD_BOX 'cd ~/ds41-flash-tp3 && python3 tp3-kit/verify-resolved-backends.py --container ds41-flash-tp3'
+```
+
+Gate 9 is the exception to "from anywhere": it is a plain HTTP call,
+but it must be run **from the checkout** — its command names the kit
+file by its checkout-relative path
+(`python3 launch/tp3-kit/check-long-prompt-determinism.py …`). From the
+staged directory the same file is `~/ds41-flash-tp3/tp3-kit/…`.
+
+The kit is staged to the boxes by `ds41-flash-tp3-up stage-env`; it is
+also in the recipe checkout under `launch/tp3-kit/`, which is the copy
+to read but not the copy to run against a remote container.
+
 ## 1. Health
 
 ```sh
@@ -9,7 +28,7 @@ curl -s -o /dev/null -w "%{http_code}" http://HEAD_IP:8600/health
 # expected: 200
 ```
 
-## 2. Deterministic generation (temp=0)
+## 2. Deterministic generation (temp=0) — short prompts
 
 Send the same prompt three times; outputs must be byte-identical:
 
@@ -22,6 +41,13 @@ for i in 1 2 3; do
 done
 # expected: identical output ×3 (e.g. "391")
 ```
+
+**What this gate does not cover.** These prompts are short — they never
+cross the chunked-prefill boundary. The failure mode that matters for
+this model lives in the *last chunk* of a chunked prefill when that chunk
+runs as a piecewise CUDA graph, so gate 9 is the one that reaches it.
+Run both; this gate alone is not evidence that the long-prompt path is
+correct.
 
 ## 3. Strict JSON compliance
 
@@ -58,7 +84,7 @@ time curl -s http://HEAD_IP:8600/v1/chat/completions \
 ```sh
 docker logs ds41-flash-tp3 2>&1 | grep "GPU KV cache size"
 # expected: roughly 1.6M-2.4M tokens (the pool is boot-labile), and a
-# concurrency figure of roughly 3-4.5x at a 524,288-token context
+# concurrency figure of roughly 3-4.7x at a 524,288-token context
 ```
 
 ## 7. Image identity
@@ -82,7 +108,71 @@ manifest digest, and the engine-identity gate
 (`launch/tp3-kit/engine-identity.json`) proves what executes inside
 the container.
 
+## 8. Resolved backends and the activation limit
+
+The command line is not the behaviour: the engine chooses its MoE
+backend, dense-linear kernel and attention backend itself. This gate
+checks what it resolved to, against the contract in
+`launch/tp3-kit/engine-identity.json`:
+
+```sh
+# on the head box, in the staged directory (the gate reads the LOCAL
+# container, so it cannot be run against a remote one)
+cd ~/ds41-flash-tp3
+python3 tp3-kit/verify-resolved-backends.py --container ds41-flash-tp3
+# expected: RESOLVED-BACKENDS PASS
+```
+
+It fails if the MoE backend is the b12x one (that path drops the model's
+clamped-SwiGLU limit on small-batch decode, with no error signal), if the
+engine resolved a different activation limit, if the TP=3 head padding is
+not in effect, or if the resolved block sizes do not match the contract.
+
+Every expectation is read from the engine's own startup log, its own
+`/metrics` and its own resolved config — and the one expectation that is
+about what was *requested* rather than what was resolved is read from the
+container's own environment, where the launcher forwards it. A missing
+marker is a **failure, not a skip**: if the engine changes what it
+prints, the gate says so instead of quietly passing. Each file that
+prints one of those markers is hash-pinned in
+`launch/tp3-kit/engine-identity.json`, so the format cannot change under
+the gate unnoticed.
+
+Run it after the engine is up — the in-container identity gate runs
+*before* it, and cannot see this.
+
+## 9. Long-prompt determinism (crosses the chunked-prefill boundary)
+
+```sh
+python3 launch/tp3-kit/check-long-prompt-determinism.py --base-url http://HEAD_IP:8600
+# expected: LONG-PROMPT-DETERMINISM PASS
+```
+
+This builds a prompt of exactly `max_num_batched_tokens + 10` tokens —
+the shape in which the last chunk of a chunked prefill is small enough to
+run as a piecewise CUDA graph — asks for it three times, and compares the
+generated **token sequence** rather than the text.
+
+The prompt is built from token IDs taken from the engine's own tokenizer
+and sent as those IDs, so the count is exact by construction; the gate
+asserts the engine's own prompt count. A fresh nonce at the head of the
+prompt keeps the first call genuinely cold even when the gate is run
+twice against the same lane.
+
+The first call is cold and the second and third hit the prefix cache, so
+a replay divergence shows up between the first and the later ones and not
+between the later ones. The decode **logprobs** are compared as well as
+the token IDs: at temperature 0 a logprob shift need not change the
+argmax token, so comparing tokens alone cannot see a replay drift. The
+measured drift is printed on every run — record it in the FIXLOG on the
+first run against a lane you are accepting, so the allowance
+(`--logprob-tol`, default 0.05) can be tightened to what the lane
+actually produces rather than left as a guess.
+
+It sends an 8k-token prefill three times. Run it against a lane you are
+accepting, not against one carrying production traffic.
+
 ## Pass criteria
 
-All seven gates must pass. A failed gate is diagnosed forward from the
+All nine gates must pass. A failed gate is diagnosed forward from the
 FIXLOG, never rolled back automatically.

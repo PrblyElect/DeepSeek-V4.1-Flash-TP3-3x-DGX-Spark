@@ -76,6 +76,12 @@ do_preflight() {
       digests=\$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' \"\$img\" 2>/dev/null)
       case \"\$digests\" in
         *@\"\$want_digest\"*) ;;
+        # No RepoDigest at all: the image was imported rather than pulled,
+        # so it carries no Hub provenance. That is NOT a mismatch -- the
+        # CONTENT check below is what pins the bytes, and it is exactly
+        # the case the content hash exists for. Match the launcher here:
+        # a missing digest warns, a DIFFERENT digest is fatal.
+        '') echo '  WARN: image carries no Hub RepoDigest -- content is pinned below, provenance is not' ;;
         *) echo '  MISSING: image manifest digest mismatch (tag moved, or wrong image)'; exit 1 ;;
       esac
 
@@ -111,8 +117,13 @@ do_stage_env() {
       || die "failed to stage cluster.env to $box"
     scp -q "$SCRIPT_DIR/start-tp3-fork.sh" "$box:~$REMOTE_DIR/start-tp3-fork.sh" \
       || die "failed to stage start-tp3-fork.sh to $box"
+    # the WHOLE kit travels: the boot gate, the identity manifest, and the
+    # two post-boot gates a reader is told to run on the box. Staging only
+    # the first two left the gates unrunnable on the box they belong to.
     scp -q "$SCRIPT_DIR/tp3-kit/boot-gate-fork.py" \
              "$SCRIPT_DIR/tp3-kit/engine-identity.json" \
+             "$SCRIPT_DIR/tp3-kit/verify-resolved-backends.py" \
+             "$SCRIPT_DIR/tp3-kit/check-long-prompt-determinism.py" \
              "$box:~$REMOTE_DIR/tp3-kit/" \
       || die "failed to stage tp3-kit to $box"
   done
