@@ -57,10 +57,32 @@ time curl -s http://HEAD_IP:8600/v1/chat/completions \
 
 ```sh
 docker logs ds41-flash-tp3 2>&1 | grep "GPU KV cache size"
-# expected: ~1,617,645 tokens, ~6.2x concurrency at 262,144
+# expected: roughly 1.6M-2.4M tokens (the pool is boot-labile), and a
+# concurrency figure of roughly 3-4.5x at a 524,288-token context
 ```
+
+## 7. Image identity
+
+```sh
+# the manifest digest must be the pinned one ...
+docker image inspect eugr/spark-vllm-b12x:nightly-20261015 \
+  --format '{{range .RepoDigests}}{{println .}}{{end}}' \
+  | grep -F 'sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595'
+
+# ... and the content identity (the layer list) must match too
+docker image inspect eugr/spark-vllm-b12x:nightly-20261015 \
+  --format '{{range .RootFS.Layers}}{{println .}}{{end}}' | sha256sum
+# expected: 41e4f9a3005bca761eb883c6565c1a3667cfbb014d49ec3d97735c7cfe146616
+```
+
+Both must hold on every box. The digest proves which manifest was
+pulled; the layer-list hash proves which bytes are on disk — an image
+imported rather than pulled can be content-identical while carrying no
+manifest digest, and the engine-identity gate
+(`launch/tp3-kit/engine-identity.json`) proves what executes inside
+the container.
 
 ## Pass criteria
 
-All six gates must pass. A failed gate is diagnosed forward from the
+All seven gates must pass. A failed gate is diagnosed forward from the
 FIXLOG, never rolled back automatically.

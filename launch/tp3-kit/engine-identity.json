@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "recorded_by": "engine-identity audit",
+  "why": "Provenance + behaviour contract for the image this recipe serves. The image is ALSO patched at runtime by the bootstrap (the valid_object shim), so a manifest digest alone does not prove what is running: the build stamp and the engine-critical file hashes do. A NEW upstream nightly will FAIL this gate until it is re-audited -- that is the intended adoption gate, not a bug.",
+  "build_stamp": {
+    "path": "/workspace/build-metadata.yaml",
+    "expect": {
+      "build_date": "2026-10-15T16:48:13Z",
+      "build_script_commit": "303b4a29a6bd390428d363358964ad298dc20625",
+      "vllm_version": "0.1.dev21830+g8244d1c44.d20261015",
+      "vllm_commit": "8244d1c44348ae8a5bbfc9f1b607021652283ed4",
+      "flashinfer_commit": "91271757f7746f3dfb58f7c2aeb44a663389de9e",
+      "gpu_arch": "12.1a"
+    }
+  },
+  "files": {
+    "vllm/models/deepseek_v41/__init__.py": "df41663a355a13140fb27ba4ef72d34ecc6e0bcbcacb51ee4b08ad4cef7c988c",
+    "vllm/models/deepseek_v4_1/common/engram.py": "efda07bdd54d947852cdf75095905033038cf2a4425d7b234d092a9253c7c811",
+    "vllm/models/deepseek_v4_1/nvidia/model.py": "dafb69b36e68c36ba8878c6033e1bc94439526c3d1d9c83edd7c153ad2ba88c8",
+    "vllm/config/engram.py": "4c794652d912db2f501b33365484d7c6bf59a26a03f78231c057d3fa09c9ec4b",
+    "flashinfer/experimental/b12x/sequence/engram/_disk.py": "8677201e34dfdf5f69e6a117559bfae50594a6726dcc68cb3830a971830f4be5",
+    "flashinfer/experimental/b12x/sequence/_shared/disk_table.py": "601348d52d488057911b5a0b22d36f0e922d80cb956c2658901bee56e63e7c9a",
+    "flashinfer/experimental/b12x/loader/_row_plan.h": "58cdf4c8f1ce94d77d75c8caf178cbc468962cd9e4552b579bf04787ab1f2a5c",
+    "flashinfer/experimental/b12x/loader/_ple_reader.c": "36bcce65d3e131a02749a21105eda1771f80ca0e55686f84c576240fa783f585"
+  },
+  "semantic": {
+    "flashinfer/experimental/b12x/preparation/artifacts.py": "valid_object must be resolvable (from b12x._lib.cache_integrity) OR the bootstrap shim must be present \u2014 the bootstrap may patch this file in-container, so its hash is deliberately NOT pinned"
+  }
+}
