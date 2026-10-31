@@ -40,8 +40,8 @@ set -euo pipefail
 # The image is also PATCHED at runtime by the bootstrap (the valid_object
 # shim), so the digest alone cannot prove what executes. The engine-identity
 # contract (tp3-kit/engine-identity.json) is enforced INSIDE the container
-# by boot-gate-fork.py; the host side asserts the image CONTENT identity
-# host — the sha256 of the RootFS layer list, which is the invariant that
+# by boot-gate-fork.py; the host side asserts the image CONTENT identity —
+# the sha256 of the RootFS layer list, which is the invariant that
 # held across both reconciliations.
 IMAGE="${IMAGE:-eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595}"
 EXPECT_IMAGE_LAYERS_SHA256="${EXPECT_IMAGE_LAYERS_SHA256:-${IMAGE_CONTENT_SHA256:-41e4f9a3005bca761eb883c6565c1a3667cfbb014d49ec3d97735c7cfe146616}}"
