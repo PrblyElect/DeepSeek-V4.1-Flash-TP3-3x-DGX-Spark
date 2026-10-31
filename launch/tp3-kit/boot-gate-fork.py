@@ -2,9 +2,8 @@
 """boot-gate-fork.py — fail-the-boot state check for the FORK posture.
 
 The b12x fork serves the NATURAL checkpoint (its loader does TP3 padding
-at runtime; an early boot in the padded-geometry posture died on 'MXFP4
-index heads must divide 64' — the fork's kernels want the ORIGINAL
-geometry). This
+at runtime; an early bring-up attempt died on 'MXFP4 index heads
+must divide 64' — the fork's kernels want the ORIGINAL geometry). This
 gate proves the model dir is the ORIGINAL pull before the engine starts:
 48 shards at root (engram included), the 12 engram index entries PRESENT,
 config untouched (heads 64, vocab 129280, engram_layer_ids [1,14]).
@@ -43,37 +42,69 @@ def sha256_file(path):
 
 
 # ------------------------------------------------------------------ model dir
+def load_json(path, what, where="in the model dir"):
+    """Read a JSON object, or fail with the gate's own line — not a traceback.
+
+    This runs inside the container before the engine starts, so a malformed
+    model dir must produce the designed `FAIL <msg>` output rather than a
+    Python stack trace the operator has to decode.
+    """
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except FileNotFoundError:
+        check(False, f"{what} present {where}")
+    except (OSError, ValueError) as exc:
+        check(False, f"{what} readable ({exc.__class__.__name__})")
+    else:
+        if isinstance(data, dict):
+            return data
+        check(False, f"{what} carries a JSON object (got {type(data).__name__})")
+    raise SystemExit(1)
+
+
+def list_model_dir():
+    """The shard listing, guarded: a missing model root is a gate failure."""
+    try:
+        return sorted(f for f in os.listdir(ROOT)
+                      if f.startswith("model-") and f.endswith(".safetensors"))
+    except OSError as exc:
+        check(False, f"model dir readable ({exc.__class__.__name__})")
+        raise SystemExit(1)
+
+
 check(os.path.exists(os.path.join(ROOT, "_DOWNLOAD_COMPLETE.json")),
       "snapshot complete (_DOWNLOAD_COMPLETE.json present)")
 
-shards = sorted(f for f in os.listdir(ROOT)
-                if f.startswith("model-") and f.endswith(".safetensors"))
+shards = list_model_dir()
 check(len(shards) == 48, f"48 shards at root (got {len(shards)}) — engram included")
 check(not os.path.isdir(os.path.join(ROOT, "engram-retained")),
       "no engram-retained/ (fork reads the files at root)")
 
 cfg_path = os.path.join(ROOT, "config.json")
 idx_path = os.path.join(ROOT, "model.safetensors.index.json")
-if not os.path.exists(cfg_path):
-    check(False, "config.json present in the model dir")
-    raise SystemExit(1)
-if not os.path.exists(idx_path):
-    check(False, "model.safetensors.index.json present in the model dir")
-    raise SystemExit(1)
 
-tc = json.load(open(cfg_path)).get("text_config") or {}
+cfg = load_json(cfg_path, "config.json")
+tc = cfg.get("text_config") or {}
 if not tc:
     check(False, "config.json carries a text_config block")
     raise SystemExit(1)
-check(tc["num_attention_heads"] == 64, "config heads == 64 (original)")
+if not isinstance(tc, dict):
+    check(False, f"config.json text_config carries an object (got {type(tc).__name__})")
+    raise SystemExit(1)
+check(tc.get("num_attention_heads") == 64, "config heads == 64 (original)")
 check(tc.get("index_n_heads") == 32, "config index_n_heads == 32 (divides 64)")
 check(tc.get("vocab_size") == 129280, f"config vocab_size == 129280 (original)")
 check(tc.get("engram_layer_ids") == [1, 14],
       "config engram_layer_ids == [1, 14] (original; fork's choice how to serve)")
 
-wm = json.load(open(idx_path)).get("weight_map") or {}
+idx = load_json(idx_path, "model.safetensors.index.json")
+wm = idx.get("weight_map") or {}
 if not wm:
     check(False, "model.safetensors.index.json carries a weight_map")
+    raise SystemExit(1)
+if not isinstance(wm, dict):
+    check(False, f"index weight_map carries an object (got {type(wm).__name__})")
     raise SystemExit(1)
 eng = [n for n in wm if ".engram." in n]
 check(len(eng) == 12, f"index carries the 12 engram entries (got {len(eng)})")
@@ -84,7 +115,7 @@ check("mtp.0.ffn.experts.128.w1.weight" not in wm,
 if not os.path.exists(IDENTITY):
     check(False, f"engine-identity.json present in the kit ({IDENTITY})")
 else:
-    spec = json.load(open(IDENTITY))
+    spec = load_json(IDENTITY, "engine-identity.json", where="in the kit")
 
     stamp = spec.get("build_stamp", {})
     spath = stamp.get("path", "")
