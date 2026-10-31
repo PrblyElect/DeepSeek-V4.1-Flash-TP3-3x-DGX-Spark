@@ -33,11 +33,15 @@ image. The field moves fast — check the community indexes before
 repeating the "only" claim.
 
 As far as is documented: this is the first TP=3 vLLM serving of
-V4.1-Flash on the eugr b12x lineage, and the first **three-node TP=3**
-recipe on this lineage to prioritize KV capacity and context length over
-throughput (the trade is documented below). The speed-optimized SGLang
-recipe from the community achieves higher tok/s but at about a third of
-the KV capacity and half the context — see **Comparison** below.
+V4.1-Flash on the **public `eugr/spark-vllm-b12x` image** lineage, and
+the first **three-node TP=3** recipe on that public image to prioritize
+KV capacity and context length over throughput (the trade is documented
+below). The scope is the public image, not the B12X kernel lineage: a
+community TP=3 vLLM fork built from source reaches a larger pool and a
+larger context still, and its figures are in the table below. The
+speed-optimized SGLang recipe from the community achieves higher tok/s
+but at about a third of the KV capacity and half the context — see
+**Comparison** below.
 
 Prerequisites: three DGX Sparks wired as a full CX-7 RoCE triangle (one
 /24 per leg, MTU 9000) plus a management LAN, the ~510 GB checkpoint
@@ -60,7 +64,7 @@ boxes, and:
 ```sh
 ./launch/ds41-flash-tp3-up preflight    # image digest + content, checkpoint, fabric
 ./launch/ds41-flash-tp3-up stage-env     # copies cluster.env + launcher + tp3-kit
-./launch/ds41-flash-tp3-up start --yes   # workers→head; :8600 in ~10–12 min
+./launch/ds41-flash-tp3-up start --yes   # head first, then the workers; :8600 in ~10–12 min
 ```
 
 `preflight` is read-only: it inspects the image that is already on the

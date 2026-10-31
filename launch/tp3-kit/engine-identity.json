@@ -55,7 +55,7 @@
       "dense_linear_kernel": "FlashInferCutlassMxfp8LinearKernel",
       "attention_backend": "b12x",
       "tp3_head_pad": "heads 64 -> 72, output groups 8 -> 9",
-      "spec_decode": "off",
+      "spec_decode": "None",
       "load_format": "safetensors",
       "swiglu_limit": 10.0,
       "scheduler_block_size": 256,

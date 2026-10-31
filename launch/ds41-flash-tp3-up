@@ -5,7 +5,7 @@
 # Usage:
 #   ./launch/ds41-flash-tp3-up preflight   # verify image, checkpoint, fabric
 #   ./launch/ds41-flash-tp3-up stage-env    # copy config + launcher to all boxes
-#   ./launch/ds41-flash-tp3-up start --yes  # launch workers→head
+#   ./launch/ds41-flash-tp3-up start --yes  # launch head first, then the workers
 #   ./launch/ds41-flash-tp3-up stop         # graceful stop all
 #   ./launch/ds41-flash-tp3-up health       # check :8600 on head
 set -euo pipefail
@@ -170,7 +170,7 @@ do_start() {
   " || die "worker B launch failed"
 
   say "start: all three launched; health in ~10–12 min"
-  say "  check: curl http://$HEAD_IP:8600/health"
+  say "  check: curl http://$HEAD_IP:$PORT/health"
 }
 
 # ---------------------------------------------------------------- stop
@@ -184,9 +184,9 @@ do_stop() {
 
 # ---------------------------------------------------------------- health
 do_health() {
-  say "health: checking engine on $HEAD_IP:8600"
+  say "health: checking engine on $HEAD_IP:$PORT"
   on "$SPARK_HEAD" "curl -s -o /dev/null -w '%{http_code}\n' --max-time 6 \
-    http://localhost:8600/health" | \
+    http://localhost:$PORT/health" | \
     while read -r code; do
       if [ "$code" = "200" ]; then
         say "health: UP (200)"

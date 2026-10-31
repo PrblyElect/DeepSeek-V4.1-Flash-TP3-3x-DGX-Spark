@@ -187,18 +187,26 @@ def main():
         return 1
 
     mnbt = args.mnbt
+    mnbt_source = "the --mnbt flag"
     if not mnbt:
         try:
             with open(args.manifest) as fh:
                 spec = json.load(fh)
+            # No default here on purpose: a manifest that does not pin the
+            # budget must fall through to the loud path below, not to a
+            # constant that happens to equal today's value.
             mnbt = int(spec.get("resolved_backends", {}).get("expect", {})
-                       .get("max_num_batched_tokens", 8192))
-        except (OSError, ValueError, TypeError):
+                       .get("max_num_batched_tokens"))
+            mnbt_source = "the manifest's pinned value"
+        except (OSError, ValueError, TypeError, KeyError):
             mnbt = 8192
+            mnbt_source = ("a FALLBACK CONSTANT — the manifest's pinned budget could "
+                           "not be read, so this run is NOT asserting the pinned "
+                           "value (gate 8 asserts the engine's actual value)")
     target = mnbt + args.last_chunk
 
     nonce = args.nonce or time.strftime("%Y%m%dT%H%M%S")
-    print(f"model={model}  max_num_batched_tokens={mnbt}  "
+    print(f"model={model}  max_num_batched_tokens={mnbt} ({mnbt_source})  "
           f"target prompt={target} tokens  nonce={nonce}")
 
     prompt_ids = build_prompt_ids(base, model, target, nonce)
@@ -267,6 +275,17 @@ def main():
         check(drift23 <= args.logprob_tol,
               f"the two cached runs agree within {args.logprob_tol} "
               f"(largest drift {drift23:.6g})")
+    else:
+        # The same rule as the cold-vs-cached comparison above: a comparison
+        # that could not be made is a FAILURE, never a silent skip. A lane
+        # that returns logprobs for runs 1 and 3 but not for run 2 would
+        # otherwise print PASS having never made this comparison at all —
+        # the exact shape of a check that cannot fail.
+        check(False, "the engine returned comparable decode logprobs for the "
+                     "two cached runs"
+                + (" — one of the runs carried no token_logprobs"
+                   if not b.get("token_logprobs") or not c.get("token_logprobs")
+                   else " — the two runs generated a different number of tokens"))
 
     # The engine's own view of the cache, if it exposes one. /metrics is
     # PROMETHEUS TEXT, not JSON -- parsing it as JSON always fails, and a

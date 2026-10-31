@@ -59,7 +59,7 @@ LOG_MARKERS = {
     "dense_linear_kernel": "Using {v} for MXFP8 GEMM",
     "attention_backend": "{v} ready attention.dsa_indexer",
     "tp3_head_pad": "Padded DeepSeek V4.1 attention for TP3: {v}",
-    "spec_decode": "speculative_config=None",
+    "spec_decode": "speculative_config={v}",
     "load_format": "load_format={v}",
     "scheduler_block_size": "kv lcm block sizes {v}",
     "max_num_batched_tokens": "max_num_batched_tokens={v}",
@@ -328,9 +328,28 @@ def main():
     # The manifest is the source of truth for the markers; the defaults here
     # are the same strings, so the check still works against an older
     # manifest that predates the `forbidden` block.
+    #
+    # COVERAGE: a forbidden marker that sits in the manifest but in no
+    # marker table is a silently DISABLED check. Adding one to the manifest
+    # would then look like it pinned something and pin nothing at all --
+    # the same class of defect as an uncovered `expect` key, so it fails
+    # here. The `.why` keys are rationale, not markers, and are exempt.
+    for key in sorted(k for k in forbidden
+                      if not k.endswith(".why") and k not in FORBIDDEN_MARKERS):
+        check(False, f"forbidden marker {key!r} is not covered by any check "
+                     f"(add it to FORBIDDEN_MARKERS)")
+
     for key, default_marker in FORBIDDEN_MARKERS.items():
+        if key.endswith(".why"):
+            continue
         marker = forbidden.get(key, default_marker)
-        if key.endswith(".why") or not marker:
+        if not marker:
+            # An EMPTY marker would look for the empty string, which is
+            # never in a log, so the check would pass for ANY log. That is
+            # the same false-pass this whole file exists to prevent.
+            check(False, f"forbidden marker {key!r} is empty — an empty marker "
+                         f"is present in no log, so the check would pass "
+                         f"whatever the engine did")
             continue
         check(marker not in logs, f"log: no {marker!r} (forbidden {key})"
               + ("" if marker not in logs else " — present in the log"))
