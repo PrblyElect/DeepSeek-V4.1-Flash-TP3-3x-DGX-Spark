@@ -99,9 +99,10 @@ do_preflight() {
 
       # 4. memory headroom (advisory; the load decides). MemAvailable reads ~0
       # on this unified-memory kernel (see the RAM-PROBE row in docs/FIXLOG.md),
-      # so measure reclaimable headroom (free + reclaimable slab + page cache;
-      # reclaimable slab + reclaimable page cache, from /proc/meminfo in kB.
-      awk '/MemFree:/{f=\$2} /SReclaimable:/{s=\$2} /Cached:/{c=\$2} END{h=(f+s+c)/1048576; if (h < 8) printf \"  WARN: only %.1f GiB reclaimable headroom\\n\", h; else printf \"  headroom: %.1f GiB reclaimable\\n\", h}' /proc/meminfo
+      # so measure reclaimable headroom the same way the launcher does: free +
+      # reclaimable slab + (active + inactive page cache - unevictable), all
+      # from /proc/meminfo in kB.
+      awk '/MemFree:/{f=\$2} /SReclaimable:/{s=\$2} /^Active\\(file\\):/{af=\$2} /^Inactive\\(file\\):/{inf=\$2} /Unevictable:/{u=\$2} END{h=(f+s+af+inf-u)/1048576; if (h < 8) printf \"  WARN: only %.1f GiB reclaimable headroom\\n\", h; else printf \"  headroom: %.1f GiB reclaimable\\n\", h}' /proc/meminfo
 
       echo '  OK'
     " || die "preflight failed on $box"

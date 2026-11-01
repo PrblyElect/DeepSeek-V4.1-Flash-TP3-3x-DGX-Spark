@@ -26,17 +26,20 @@ pinning, engram host staging, loader bounce buffers, and the startup
 free-memory check — each with its measured fix.
 
 **A published vLLM TP3 recipe for V4.1-Flash on a publicly available
-image.** Other V4.1-on-Spark recipes either use SGLang (a different
-serving engine), require building a custom vLLM fork from source, or
-target TP4 with a 4th box. This one is three commands with a pre-built
-image. The field moves fast — check the community indexes before
-repeating the "only" claim.
+image.** This one is three commands with a pre-built image. The field moves
+fast — check the community indexes before repeating the "only" claim.
 
-As far as is documented: this is the first TP=3 vLLM serving of
-V4.1-Flash on the **public `eugr/spark-vllm-b12x` image** lineage, and
-the first **three-node TP=3** recipe on that public image to prioritize
-KV capacity and context length over throughput (the trade is documented
-below). The scope is the public image, not the B12X kernel lineage: a
+**This is not the only three-node TP=3 recipe on the public image.** The
+project that publishes the image now ships its own
+`recipes/3x-spark-cluster/deepseek-v4.1-flash.yaml` — the same model, the
+same image lineage, the same three-node shape. It is a recipe for their
+cluster runner, with no acceptance gates of its own, and it asks for a
+smaller KV pool and fewer concurrent sequences than this one, and a
+context derived from that pool. The difference between the two is the trade this recipe makes;
+the side-by-side is in **Upstream's own 3-node recipe** below, and where
+they differ, that table is the reason this recipe reads the way it does.
+
+The scope here is the public image, not the B12X kernel lineage: a
 community TP=3 vLLM fork built from source reaches a larger pool and a
 larger context still, and its figures are in the table below. The
 speed-optimized SGLang recipe from the community achieves higher tok/s
@@ -139,6 +142,40 @@ no spec decode, engram on NVMe):
 | Reasoning parser (deepseek_v41) | working |
 
 (All gate numbers refer to `docs/VALIDATION.md`, which ships with the recipe.)
+
+### Where the boot time goes
+
+The cold boot above is ~12 minutes, and the weight load is ~200 s of it.
+The balance is the **b12x GEMM autotune** — estimated from those two
+figures, not separately timed: the engine compiles a plan of
+several thousand kernels for the shapes this model and this batch width
+produce, and the boot log shows each shape starting from
+`0 cached, 0 compilations`.
+
+The compiled artifacts are cached under `/root/.cache/b12x` — **inside the
+container's writable layer**, which is discarded when the container is
+recreated. The cache therefore never survives a boot, and every boot pays
+the full compile.
+
+Two knobs in the pinned build can change that, and this recipe sets
+neither: `VLLM_USE_AOT_COMPILE` and `VLLM_USE_MEGA_AOT_ARTIFACT` (both
+default off; upstream's own vision recipe sets both). No AOT artifact is
+baked into the image, so enabling them changes *what is compiled*, not
+*what is reused* — persistence still has to come from a mount that
+outlives the container.
+
+What this recipe does **not** do is raise the compile parallelism. More
+compile workers is the tempting answer and the wrong one: a wider batch
+width has already been observed to kill the worker ranks during the
+compile phase, and the compile-time memory spike on unified memory is
+what makes that happen. A cache hit reduces both the boot time and that
+risk; more workers increase the second.
+
+Enabling any of this needs a measurement across two boots, and it needs
+the cache keyed by the image build stamp — a stale artifact is a *wrong
+kernel*, which is a worse failure than a slow boot. That is an operator
+experiment on a lane, not a desk change, so the recipe documents the
+knobs and leaves the default alone.
 
 ## Why capacity over speed
 
@@ -258,14 +295,15 @@ default seccomp profile blocks. Fix:
 
 ## Configuration
 
-The launch environment (`config/cluster.env`). The launcher reads the
+The launch environment (`config/cluster.env`). The bring-up tool
+(`launch/ds41-flash-tp3-up`) reads the
 box names and IPs, the checkpoint path (`MODEL_DIR` — it must exist on
 every box), the image pins, the container name, the Docker security
 options, and the serving knobs below; the remaining lines are plumbing
 the launcher consumes — keep the two in step:
 
 ```sh
-# Cluster (EDIT THESE — the launcher reads them from here)
+# Cluster (EDIT THESE — the bring-up tool reads them from here)
 SPARK_HEAD="spark-head.local"      # head / rank 0
 SPARK_A="spark-a.local"             # worker / rank 1
 SPARK_B="spark-b.local"             # worker / rank 2
@@ -371,6 +409,7 @@ pass. On this configuration the engine resolves:
 | TP=3 head padding | 64 heads → 72, in 9 output groups |
 | speculative decode | off |
 | load format | `safetensors` |
+| all-reduce transport | `PYNCCL` (see **The one-shot RoCE all-reduce is not engaged on this fabric**) |
 
 Two of those are load-bearing and are checked, not assumed:
 
@@ -387,6 +426,68 @@ and its own resolved config; a missing marker is a failure, not a skip.
 Every file that prints one of those markers is hash-pinned in the
 engine-identity manifest, so a newer image cannot change what a marker
 says without the gate noticing.
+
+### The one-shot RoCE all-reduce is not engaged on this fabric
+
+The launcher sets `VLLM_ENABLE_ROCE_ALLREDUCE=1` and
+`VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB`, matching upstream's own three-node
+recipe. The image also ships a one-shot RoCE collective
+(`B12X_ROCENANTE`) that needs **both** RoCE rails of a link to reach the
+peer. The topology this recipe ships has **one cable per leg**, so that
+collective cannot form. The engine's own log says so and moves on:
+
+```
+RoCEnante initialization failed: RoCE all-reduce connect failed:
+rank 0: … 1 of 2 RoCE rails have a link to rank 1 …
+```
+
+(abridged: the line continues with each rank's local and remote interface
+list.)
+
+and then reports what it engaged instead:
+
+```
+Using ['PYNCCL'] all-reduce backends (in dispatch order) for group 'tp:0'
+out of potential backends: ['FLASHINFER_PCIE_IPC', 'B12X_PCIE', ...]
+```
+
+(abridged: the engine lists every backend it could have used.)
+
+`B12X_ROCENANTE` is not in that list. The reduction is carried by stock
+NCCL over the same fabric, and it works — every number published in this
+recipe was measured that way.
+
+None of this is visible from the recipe's command line: the knob is set,
+the collective is absent, and the fallback is silent. So the expectation
+now lives in the engine-identity manifest and gate 8 asserts it, reading
+the engine's own dispatch line for every group the engine reports. The
+**expected** value on this topology is `PYNCCL`.
+
+**If the transport ever changes**, gate 8 will **fail** — deliberately,
+because the manifest still describes the old one. Read the transport out
+of the engine's own dispatch line and update
+`launch/tp3-kit/engine-identity.json`
+(`resolved_backends.expect.allreduce_backend`) to match, and the gate
+asserts the new one. A fabric change should be a recorded decision rather
+than an unrecorded one.
+
+Note that a second rail per leg is **off NVIDIA's documented topology**:
+their cluster guidance says to use one cable per link, and that connecting
+two devices with two cables will not improve performance. The collective
+needs both rails of a link to reach the same peer, so engaging it means a
+cabling NVIDIA does not recommend. That is a performance experiment to
+run deliberately, with the numbers recorded — not a fix.
+
+This is not a defect to fix in the recipe. The [DGX Spark release
+notes](https://docs.nvidia.com/dgx/dgx-spark/release-notes.html) record
+that NCCL 2.30u1 "has updated support for connecting three DGX Spark
+systems in a ring topology", and NVIDIA's
+[cluster guidance](https://docs.nvidia.com/sync/0.97.6/cluster-assistant.html)
+describes that topology as "three cables for a direct connection in which
+each device connects to the other two" — which is exactly the triangle
+this recipe ships. The stock path is therefore the supported one, and the
+published figures here were measured on it. Enabling the one-shot
+collective is a performance experiment, not a correctness fix.
 
 ### Re-audit triggers
 
@@ -452,6 +553,28 @@ model's index but are never loaded into host or GPU memory — the
 during inference. This is the same approach the community SGLang recipe
 describes.
 
+### Auto-prefetch is not available for this checkpoint
+
+The engine has an optional auto-prefetch path for the engram tables, and
+on this hardware it refuses it for two reasons of its own: the filesystem
+is not a recognised network FS (NFS/Lustre), and the checkpoint is larger
+than 90% of available RAM.
+
+The second reason is the decisive one, and it is arithmetic rather than
+configuration. The precondition is that the checkpoint fits inside 90% of
+the memory **available at load time**. This model's checkpoint is larger
+than 90% of the whole box's ~121 GiB of unified memory — ~109 GiB — so it
+fails that test on an idle box with nothing else running, let alone on a
+loaded one. Moving the checkpoint to a network filesystem fixes the first
+reason and leaves the second exactly as it was.
+
+So the posture this recipe already takes —
+`--engram-config '{"cpu_offload":false,"table_memory":"disk"}'`, the same
+setting upstream's own three-node recipe uses — is the answer, and there
+is no further work to do here. If a smaller checkpoint is ever wanted, an
+FP8 subset or a lower-bitpoint variant, that is a checkpoint question and
+it would change the arithmetic; it is not a prefetch question.
+
 ## Speculative decode: tested and rejected
 
 DSpark speculative decoding (k=5) was tested and rejected on capacity
@@ -480,10 +603,105 @@ landscape, not to claim a win.
 | [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f) | vLLM (custom fork) | 3 or 4 | built from the repo; one image serves every shape | 1.3M–5.5M (TP3) – 11.6M (TP4) tokens | 256K (TP3, 4k) / 1M (TP3, TP4) |
 | [tonyd2wild](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-TP2-and-TP4-DGX-Sparks) | TensorFold (a Zig engine); older vLLM lanes | 2 or 4 | engine built from source | 1.05M (TP2) – 29M positions | 300K – 1M |
 
-Two things this recipe does differently from all of them: the engine
+Two things this recipe does differently from all three of them: the engine
 image is **public** — pull it by digest and the boot is reproducible —
 and the shape is three nodes on a RoCE triangle rather than a
 switchless ring of four.
+
+## Upstream's own 3-node recipe
+
+The project that publishes the image ships a recipe system of its own —
+`recipes/<model>.yaml`, plus `recipes/3x-spark-cluster/`,
+`run-recipe.py`, `cluster_topology.py`, `autodiscover.sh` and a
+`Dockerfile.mxfp4` — and among those recipes is
+`recipes/3x-spark-cluster/deepseek-v4.1-flash.yaml`: the same model, the
+same image lineage, the same three-node triangle.
+
+It is worth reading, and it is not a competitor. It is a YAML for their
+cluster runner on their cluster shape, with `cluster_only: true` and
+no acceptance gates of its own. It
+is also the best available evidence that a three-node V4.1-Flash lane is
+reproducible from public parts.
+
+Where the two differ:
+
+| knob | this recipe | upstream 3-node |
+|---|---|---|
+| `--kv-cache-memory-bytes` | `4g` | `0.5g` |
+| `--gpu-memory-utilization` | `0.85` | `0.87` |
+| `--max-num-seqs` | `8` | `2` |
+| `--max-num-batched-tokens` | `8192` | `4096` |
+| `--max-model-len` | `524288` | `auto` |
+| speculative decode | off | dspark, 7 tokens |
+| `--load-format` | `safetensors` | `b12x` |
+| linear / MoE / attention backend | unset — the engine's own policy | pinned `b12x` ×3 |
+
+Two rows are the recipe's whole thesis, and they pull in opposite
+directions from upstream's: upstream asks for **8× less KV cache** and **4×
+fewer concurrent sequences**, with the context derived from that smaller
+pool, which is a speed-shaped lane. This recipe asks for a **large pool and a pinned 512K
+context**, which is a capacity-shaped lane, and accepts roughly 29 tok/s
+for that.
+
+Two rows are not a preference but a measured constraint on this hardware.
+The `safetensors` loader instead of `b12x` is wall 3 in the bring-up
+below: the b12x loader's pinned bounce buffers OOM a busy head node.
+And leaving the backends unset is deliberate — the engine's own policy
+is what gate 8 audits, so pinning them would remove the very thing the
+gate exists to check.
+
+## Upstream delta to watch
+
+This recipe pins a specific nightly, so the useful question is what has
+moved upstream since. The pinned build is `v0.1.dev21830+g8244d1c44` from
+the 2026-10-15 nightly, which sits inside the upstream v0.32.0 window —
+most of v0.32.0 is already here. The table below separates what the pin
+already contains from what arrived after it, because a list that mixes the
+two cannot be read as a delta.
+
+| upstream | status | in the pin? | relevance here |
+|---|---|---|---|
+| [#64441](https://github.com/vllm-project/vllm/pull/64441) [1/N] top-k order | **open** | no | batch invariance for DeepSeek V4 — the upstream defect, see the note below |
+| [#64870](https://github.com/vllm-project/vllm/pull/64870) [2/N] compressor | **open** | no | the same series |
+| [#64884](https://github.com/vllm-project/vllm/pull/64884) [3/N] mHC | **open** | no | the same series |
+| [#58720](https://github.com/vllm-project/vllm/pull/58720) indexed expert-mapping lookups | v0.32.0 | yes | −25 s weight load on DGX Spark; the load here takes ~200 s |
+| [#54048](https://github.com/vllm-project/vllm/pull/54048) cuBLAS out_dtype router GEMM | v0.32.0 | yes | a GB10-specific GEMM path |
+| [#58925](https://github.com/vllm-project/vllm/pull/58925) encoder CUDA-graph packing for V4.1 | v0.32.0 | yes | mean TTFT on vision workloads |
+| [#58132](https://github.com/vllm-project/vllm/pull/58132) / [#59532](https://github.com/vllm-project/vllm/pull/59532) SWA bounded replay | v0.32.0 | yes | the SWA geometry the block-size story above depends on |
+| [#58877](https://github.com/vllm-project/vllm/pull/58877) OAI Triton MXFP4 MoE on SM12x | v0.32.0 | yes | a second MXFP4 MoE path for sm_121 |
+| [#46963](https://github.com/vllm-project/vllm/pull/46963) / [#60452](https://github.com/vllm-project/vllm/pull/60452) NVFP4 KV + XQA decode on SM12x | v0.32.0 | yes | halves KV bytes per token |
+| [#59604](https://github.com/vllm-project/vllm/pull/59604) ModelOpt IQ2_XS/XXS/Q8_0 via b12x | Oct 13 | yes (pre-pin) | smaller weights → more pool, if a checkpoint exists |
+| [#54163](https://github.com/vllm-project/vllm/pull/54163) DFlash/DSpark keep the last prefix-cache block | ~Oct 23 | no | upstream-validated on 4× Spark TP4 with GLM-5.3-Flash + DFlash2 — the closest prior art to this hardware |
+| [#63421](https://github.com/vllm-project/vllm/pull/63421) AV draft-budget selector | Oct 26 | no | host-side latency under adaptive verification |
+| [#63886](https://github.com/vllm-project/vllm/pull/63886) DSpark batch-sharded sequential block | ~Oct 30 | no | the closest upstream artefact to draft handling at TP>1 |
+| [#62183](https://github.com/vllm-project/vllm/pull/62183) / [#62384](https://github.com/vllm-project/vllm/pull/62384) APC + SWA bounded replay under PCP | Oct 19 / 23 | no | prefix cache + SWA geometry, but PCP is a datacenter shape |
+
+The table above is a selection, not the whole delta: roughly twenty pull
+requests moved after the pin, and the eight marked `no` are the ones worth
+watching. The only correctness-class work among them is the
+batch-invariance series — three pull requests, all still open. Everything
+else is performance or plumbing.
+
+**The batch-invariance series is open.** All three parts of the upstream
+DeepSeek-V4 batch-invariance work are still unmerged, the third filed
+within days of the first. Any claim that upstream has fixed DS-V4.1
+batch invariance would be wrong today, and would start being wrong in the
+other direction the day it merges. This recipe does not make that claim,
+and it does not claim to cover the property either: **gate 9 measures
+repeat- and cache-state invariance of a single request, not batch
+composition**, so it is adjacent to the upstream defect rather than a
+substitute for the upstream fix. Batch-composition invariance needs the
+engine patch; measuring it on a lane would need a second, concurrent
+harness, which this recipe does not ship.
+
+**The rest is watch, not adopt.** Most of this delta is performance or
+plumbing. Two entries would change what the recipe *is* rather than how
+fast it runs: the NVFP4 KV path — a different KV byte layout, so a
+different pool figure and a different `/metrics` block size — and the
+ModelOpt quantisation path, which is a different checkpoint. The ModelOpt
+**code** is already inside this pin — what is missing is a quantised
+checkpoint to use it with. Either way, moving onto either path is a
+re-audit rather than an upgrade.
 
 ## Credits
 

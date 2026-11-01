@@ -126,7 +126,35 @@ python3 tp3-kit/verify-resolved-backends.py --container ds41-flash-tp3
 It fails if the MoE backend is the b12x one (that path drops the model's
 clamped-SwiGLU limit on small-batch decode, with no error signal), if the
 engine resolved a different activation limit, if the TP=3 head padding is
-not in effect, or if the resolved block sizes do not match the contract.
+not in effect, if the resolved block sizes do not match the contract, or
+if the all-reduce transport that actually engaged is not the one the
+manifest expects.
+
+### The all-reduce expectation
+
+One expectation is about the transport rather than a kernel, and it needs
+a word of its own because it is the one that a **physical** change can
+break.
+
+The launcher sets `VLLM_ENABLE_ROCE_ALLREDUCE=1`, and the image ships a
+one-shot RoCE collective (`B12X_ROCENANTE`) that needs both RoCE rails of
+a link to reach the peer. The topology this recipe ships has one cable
+per leg, so that collective cannot form: the engine logs the failure and
+engages `PYNCCL` instead. The gate asserts the transport that **actually
+engaged**, on every group the engine reports, against
+`resolved_backends.expect.allreduce_backend` in the manifest.
+
+On the shipped topology the expected value is `PYNCCL`, and the published
+figures were all measured on that path.
+
+If you re-cable a second rail per leg, this gate will **fail**, and it is
+meant to: the engine will engage the collective, and the expectation now
+describes a lane that no longer exists. Update
+`launch/tp3-kit/engine-identity.json`
+(`resolved_backends.expect.allreduce_backend`) to `B12X_ROCENANTE` at the
+same time, and the gate then asserts the new transport. The failure
+message prints the engine's own diagnostic so the reason is in front of
+you rather than inferred.
 
 Every expectation is read from the engine's own startup log, its own
 `/metrics` and its own resolved config — and the one expectation that is
