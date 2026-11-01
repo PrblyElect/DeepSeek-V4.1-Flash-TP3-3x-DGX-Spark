@@ -10,7 +10,8 @@
 # (_pad_to_supported_q_heads in flashinfer_sparse).
 #
 # CHECKPOINT POSTURE: the 4-tensor vocab pad (129408) and the head pads
-# (72) are REQUIRED -- the fork's vocab range still divides raw, verified
+# (72) are REQUIRED -- the fork runtime-pads the raw 129,280 vocab to a
+# TP3-divisible 129,408 at load (the checkpoint file itself stays raw), verified
 # in-image, while the B12X loader reads the standard HF layout.
 # Engram: ON, DISK-RESIDENT -- on GB10 (compute capability 12.x) the model
 # dispatches to vllm.models.deepseek_v4_1, whose engram reads the tables
@@ -112,7 +113,6 @@ SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-${ALIAS_NAME:-main}}"
 TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-deepseek_v41}"
 REASONING_PARSER="${REASONING_PARSER:-deepseek_v41}"
 DIST_MASTER_PORT="${DIST_MASTER_PORT:-25000}"
-SERVED_NAME="${SERVED_NAME:-deepseek-v4.1-flash}"
 MODEL_DIR="${MODEL_DIR:-$HOME/models/deepseek-v4.1-flash-1017-1bae0e10}"
 CONTAINER_NAME="${CONTAINER_NAME:-ds41-flash-tp3}"
 EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:-}"
@@ -369,7 +369,6 @@ run_args=(
   -e RUNAI_STREAMER_MEMORY_LIMIT=4294967296
   -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"
   -e PORT="$PORT" -e TP="$TP" -e GMU="$GMU" -e CTX="$CTX" -e MNBT="$MNBT"
-  -e SERVED_NAME="$SERVED_NAME" -e ALIAS_NAME="$ALIAS_NAME"
   -e EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS"
   -v "$MODEL_DIR:/model:ro"
   -v "$KIT_DIR:/kit:ro"

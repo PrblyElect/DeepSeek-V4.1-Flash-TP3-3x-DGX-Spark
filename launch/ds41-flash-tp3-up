@@ -97,8 +97,11 @@ do_preflight() {
         echo '  MISSING: checkpoint not staged'; exit 1
       fi
 
-      # 4. memory headroom (advisory; the load decides)
-      free -g | awk '/Mem:/{if (\$7 < 100) { print \"  WARN: only \" \$7 \" GiB available\"; }}'
+      # 4. memory headroom (advisory; the load decides). MemAvailable reads ~0
+      # on this unified-memory kernel (see the RAM-PROBE row in docs/FIXLOG.md),
+      # so measure reclaimable headroom (free + reclaimable slab + page cache;
+      # reclaimable slab + reclaimable page cache, from /proc/meminfo in kB.
+      awk '/MemFree:/{f=\$2} /SReclaimable:/{s=\$2} /Cached:/{c=\$2} END{h=(f+s+c)/1048576; if (h < 8) printf \"  WARN: only %.1f GiB reclaimable headroom\\n\", h; else printf \"  headroom: %.1f GiB reclaimable\\n\", h}' /proc/meminfo
 
       echo '  OK'
     " || die "preflight failed on $box"

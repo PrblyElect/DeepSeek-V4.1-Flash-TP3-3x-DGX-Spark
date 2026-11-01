@@ -89,7 +89,7 @@ the boot is allowed to execute).
 
 ### Reading the container command without starting it
 
-`PRINT_CMD=1` prints the `docker run` command the launcher would run
+`PRINT_CMD=1` prints the `docker run` command the boot script would run
 and exits. No container is started, no GPU is touched, and the recipe's
 own pre-boot assertions still run first — so what you read is a command
 that would actually have been accepted.
@@ -138,6 +138,8 @@ no spec decode, engram on NVMe):
 | Tool calling (deepseek_v41) | working |
 | Reasoning parser (deepseek_v41) | working |
 
+(All gate numbers refer to `docs/VALIDATION.md`, which ships with the recipe.)
+
 ## Why capacity over speed
 
 The community SGLang recipe for this model on the same hardware
@@ -157,7 +159,7 @@ The trade-off table:
 | | This recipe (vLLM) | Community SGLang |
 |---|---|---|
 | KV pool | **~2M tokens** | 750K tokens |
-| Context | **512K** | 262K |
+| Context | **512K** | 262K (their "256k limit") |
 | Concurrency @ 262K | **~6–9×** | ~2.9× (derived) |
 | Speed | 29 tok/s | **51 tok/s** |
 | Spec decode | off (capacity) | on (speed) |
@@ -257,8 +259,10 @@ default seccomp profile blocks. Fix:
 ## Configuration
 
 The launch environment (`config/cluster.env`). The launcher reads the
-box names and IPs, the image pins, and the serving knobs below; anything
-else in this file is inert, so keep the two in step:
+box names and IPs, the checkpoint path (`MODEL_DIR` — it must exist on
+every box), the image pins, the container name, the Docker security
+options, and the serving knobs below; the remaining lines are plumbing
+the launcher consumes — keep the two in step:
 
 ```sh
 # Cluster (EDIT THESE — the launcher reads them from here)
@@ -414,8 +418,9 @@ Per-node memory budget at the shipped configuration:
 | KV cache (4 GiB reserved) | 3.7 GiB |
 | NCCL buffers (capped) | 0.14 GiB |
 | CUDA context + framework | ~4 GiB |
+| Compile/CUDA-graph arenas | ~2 GiB |
 | Host OS + daemons | ~8 GiB |
-| **Free (serving)** | **~7 GiB (static estimate — see below)** |
+| **Free (serving, static estimate)** | **~8 GiB — see below** |
 
 This table is an arithmetic estimate, not a measurement, and the
 difference matters. Once the weights are resident, the *measured*

@@ -8,7 +8,7 @@ local `docker` binary and must run **on the head box**, in the staged
 directory (`~/ds41-flash-tp3/`), where the container actually lives:
 
 ```sh
-ssh HEAD_BOX 'cd ~/ds41-flash-tp3 && python3 tp3-kit/verify-resolved-backends.py --container ds41-flash-tp3'
+ssh SPARK_HEAD 'cd ~/ds41-flash-tp3 && python3 tp3-kit/verify-resolved-backends.py --container ds41-flash-tp3'
 ```
 
 Gate 9 is the exception to "from anywhere": it is a plain HTTP call,
