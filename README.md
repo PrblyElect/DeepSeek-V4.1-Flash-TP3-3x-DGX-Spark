@@ -287,7 +287,9 @@ KV_CACHE_MEMORY_BYTES=4g
 PORT=8600
 TP=3
 MAX_NUM_SEQS=8
-MAX_NUM_BATCHED_TOKENS=8192
+MAX_NUM_BATCHED_TOKENS=8192       # do not raise without a memory plan: 16384
+                                  # OOM-killed both worker ranks during the b12x
+                                  # compile phase (see FIXLOG failure mode 9)
 BLOCK_SIZE=256
 
 # Loader
