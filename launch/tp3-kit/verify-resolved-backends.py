@@ -76,6 +76,44 @@ FORBIDDEN_MARKERS = {
     "nvfp4_moe_backend": "NvFp4 MoE backend",
 }
 
+# Which all-reduce ACTUALLY ENGAGED.
+#
+# The recipe sets VLLM_ENABLE_ROCE_ALLREDUCE=1 and
+# VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB, and the image ships a one-shot RoCE
+# collective (B12X_ROCENANTE) that needs BOTH RoCE rails of every link to
+# reach the peer. The shipped topology is ONE CABLE PER LEG, so the
+# collective cannot form: the engine logs the failure and falls through to
+# PYNCCL. Nothing about that is visible from the recipe's command line --
+# the knob is set, the collective is absent, and the reduction is carried
+# by a different path with no error signal.
+#
+# So the check states what happened rather than what was requested. The
+# EXPECTED value lives in the manifest, so a reader who re-cables a second
+# rail per leg gets a FAIL here until they update the expectation: the
+# fabric change becomes a gated event instead of an unrecorded one.
+ALLREDUCE_RE = re.compile(r"Using \[([^\]]*)\] all-reduce backends")
+ALLREDUCE_KEYS = ("allreduce_backend",)
+
+
+def norm_backends(raw):
+    """Normalise a backend list to bare, unquoted names.
+
+    The engine prints the ENGAGED backends as a Python list repr --
+    ``Using ['PYNCCL'] all-reduce backends`` -- so the captured text carries
+    the quotes. A manifest expectation is written without them, so comparing
+    the raw text would fail a healthy lane on punctuation alone. Both sides
+    are normalised the same way, and a name that differs only by quoting is
+    treated as the same backend.
+    """
+    if raw is None:
+        return None
+    names = []
+    for part in raw.split(","):
+        name = part.strip().strip("'\"").strip()
+        if name:
+            names.append(name)
+    return tuple(names)
+
 # Metrics that must read exactly. Keyed by the cache_config_info label.
 METRIC_KEYS = {
     "reported_block_size": "block_size",
@@ -285,7 +323,7 @@ def main():
     # expectation: renaming a key in the manifest would turn its check
     # into a no-op instead of a failure. Uncovered keys fail here.
     covered = (set(LOG_MARKERS) | set(METRIC_KEYS) | set(CONFIG_KEYS)
-               | set(CMD_MARKERS) | set(ENV_MARKERS))
+               | set(CMD_MARKERS) | set(ENV_MARKERS) | set(ALLREDUCE_KEYS))
     for key in sorted(k for k in expect if k not in covered):
         check(False, f"expectation {key!r} is not covered by any check "
                      f"(add it to LOG_MARKERS, METRIC_KEYS, CMD_MARKERS or CONFIG_KEYS)")
@@ -298,6 +336,36 @@ def main():
         marker = template.format(v=want)
         check(marker in logs, f"log: {key} == {want!r}"
               + ("" if marker in logs else f" — marker not found: {marker!r}"))
+
+    # --- which all-reduce ACTUALLY engaged --------------------------------
+    # Not a marker match on the requested backend: the engine prints the
+    # backend it engaged, and that is the fact worth asserting.
+    #
+    # The engine prints one dispatch line PER GROUP (the TP group and the EP
+    # group), and the groups are independent. Reading only the first line
+    # would let a lane that engaged the collective on one group and fell
+    # back on the other pass, so every line must agree.
+    want_ar = expect.get("allreduce_backend")
+    if want_ar is not None:
+        want_norm = norm_backends(want_ar)
+        engaged = [norm_backends(m.group(1))
+                   for m in ALLREDUCE_RE.finditer(logs)]
+        if not engaged:
+            check(False, f"log: allreduce_backend == {want_ar!r} — the dispatch "
+                         f"line was not found in the engine log")
+        else:
+            wrong = [g for g in engaged if g != want_norm]
+            check(not wrong, f"log: allreduce_backend == {want_ar!r}"
+                  + ("" if not wrong
+                     else " — the engine engaged "
+                          + ", ".join(repr(", ".join(g)) for g in wrong)))
+            if wrong:
+                diag = re.search(r"RoCEnante initialization failed:[^\n]*", logs)
+                if diag:
+                    print("       the engine's own diagnostic: "
+                          + diag.group(0).strip()[:200])
+                print("       the one-shot RoCE collective needs BOTH RoCE rails "
+                      "of every link; the shipped topology has one cable per leg")
 
     # --- the container's own environment: what was FORWARDED --------------
     # and the command line: what was REQUESTED. A knob that was read but

@@ -9,10 +9,12 @@
 # DSparkV41DraftModel, the B12X loader, and the runtime q-head padding
 # (_pad_to_supported_q_heads in flashinfer_sparse).
 #
-# CHECKPOINT POSTURE: the 4-tensor vocab pad (129408) and the head pads
-# (72) are REQUIRED -- the fork runtime-pads the raw 129,280 vocab to a
-# TP3-divisible 129,408 at load (the checkpoint file itself stays raw), verified
-# in-image, while the B12X loader reads the standard HF layout.
+# CHECKPOINT POSTURE: the NATURAL checkpoint is REQUIRED -- heads 64, vocab
+# 129280, no padded drafter expert. The fork pads at runtime, and the boot
+# gate proves the model directory is the original pull before the engine
+# starts. The raw vocabulary (129280) is also not divisible by the TP world
+# size, so the single --served-model-name path is what avoids the vocabulary
+# check, while the B12X loader reads the standard HF layout.
 # Engram: ON, DISK-RESIDENT -- on GB10 (compute capability 12.x) the model
 # dispatches to vllm.models.deepseek_v4_1, whose engram reads the tables
 # (~63 GiB per rank on NVMe) through the B12X native io_uring reader, two
