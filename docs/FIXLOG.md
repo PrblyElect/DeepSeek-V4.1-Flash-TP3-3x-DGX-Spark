@@ -1,7 +1,7 @@
 # FIXLOG — ds41-flash-tp3 (V4.1-Flash on 3× DGX Spark, vLLM b12x)
 
 Every failure mode encountered during bring-up, its root cause, and its
-fix. Ordered by severity (boot-fatal → quality).
+fix. Roughly ordered by when each failure was met on the road to first light (boot-fatal modes first).
 
 | # | Symptom | Root cause | Fix |
 |---|---|---|---|
