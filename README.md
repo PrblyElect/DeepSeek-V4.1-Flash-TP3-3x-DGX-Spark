@@ -15,11 +15,14 @@ tags:
 **TL;DR** — Serve DeepSeek-V4.1-Flash (552B total, native FP4+FP8 MoE
 with a 196B engram conditional-memory block) tensor-parallel across three
 DGX Sparks on a 200G CX-7 RoCE triangle, using the eugr b12x vLLM fork
-on a public Docker Hub image. Capacity-optimized: a **~2M-token KV
-pool** at **512K context** — the pool is boot-labile, landing between
-roughly 1.6M and 2.4M tokens depending on the boot — for **~6–9×
-concurrency** at 262K and **~3–4.7×** at 512K. ~29 tok/s single-stream
-(prose, no spec decode). Engram n-gram tables are served from NVMe,
+on a public Docker Hub image. Capacity-optimized: a **4 GiB KV
+reservation** at **1M context** — the reservation is fixed by a pin, and
+the engine's token figure scales with the context value at the same
+block count (roughly 2.4M tokens at 512K, roughly 3.1M at 1M; one full
+1M request fits with room to spare). **~29 tok/s single-stream** (prose,
+no spec decode), and a short request's first token lands in **under five
+seconds even beside a deep multi-hundred-K prefill** (parallel prefills,
+measured — see FIXLOG). Engram n-gram tables are served from NVMe,
 freeing 31 GiB/rank of host memory that would otherwise be consumed.
 The bring-up maps every memory trap on GB10 unified memory: NCCL buffer
 pinning, engram host staging, loader bounce buffers, and the startup
@@ -40,14 +43,17 @@ the side-by-side is in **Upstream's own 3-node recipe** below, and where
 they differ, that table is the reason this recipe reads the way it does.
 
 The scope here is the public image, not the B12X kernel lineage: a
-community TP=3 vLLM fork built from source reaches a larger pool and a
-larger context still, and its figures are in the table below. The
-speed-optimized SGLang recipe from the community achieves higher tok/s
+community TP=3 vLLM fork built from source reaches a larger pool (up to
+5.5M tokens on three nodes) and a larger context (1M) on both its three-
+and four-node shapes — with a 64 KiB-page kernel and the memory saver; on
+a stock 4 KiB-page box its three-node shape is 256K. Its figures are in the
+table below. The speed-optimized SGLang recipe from the community achieves higher tok/s
 but at about a third of the KV capacity and half the context — see
 **Comparison** below.
 
-Prerequisites: three DGX Sparks wired as a full CX-7 RoCE triangle (one
-/24 per leg, MTU 9000) plus a management LAN, the ~510 GB checkpoint
+Prerequisites: three DGX Sparks wired as a full CX-7 RoCE triangle (three
+cables, each box connected to the other two, one /24 per pair of boxes,
+MTU 9000) plus a management LAN, the ~510 GB checkpoint
 and the digest-pinned image staged on every box, and Docker with GPU
 support.
 
@@ -67,7 +73,7 @@ boxes, and:
 ```sh
 ./launch/ds41-flash-tp3-up preflight    # image digest + content, checkpoint, fabric
 ./launch/ds41-flash-tp3-up stage-env     # copies cluster.env + launcher + tp3-kit
-./launch/ds41-flash-tp3-up start --yes   # head first, then the workers; :8600 in ~10–12 min
+./launch/ds41-flash-tp3-up start --yes   # head first, then the workers; :8600 in ~5–6 min
 ```
 
 `preflight` is read-only: it inspects the image that is already on the
@@ -124,20 +130,22 @@ the defect class this recipe has already been bitten by.
 
 ## Served numbers
 
-Measured at the shipped configuration (gmu 0.85, 4 GiB KV, 512K context,
-no spec decode, engram on NVMe):
+Measured at the shipped configuration (gmu 0.85, 4 GiB KV, 1M context,
+parallel prefills ×2 + decode-aware policy, kernel autotune off, no spec
+decode, engram on NVMe):
 
 | Metric | Value |
 |---|---|
 | Single-stream decode (prose) | ~29 tok/s |
-| TTFT (short prompt) | 1–2 s |
+| TTFT (short prompt, idle) | 1–2 s |
+| TTFT (short prompt beside a deep prefill) | **under 5 s** (was tens of seconds before parallel prefills; the deep prefill itself is unaffected) |
 | Weights per rank | 95.4 GiB |
-| KV pool | **~2M tokens** (boot-labile: ~1.6–2.4M) |
-| Context length | **524,288 (512K)** |
-| Concurrency at 262K ctx | **~6–9×** |
-| Concurrency at 512K ctx | **~3–4.7×** |
-| Cold boot (load→health) | ~12 min (200 s load) |
-| Temp-0 determinism | identical across runs — short prompts (gate 2). The long-prompt path is a separate gate (9) and is not covered by gate 2. |
+| KV reservation | **4 GiB** (fixed by `--kv-cache-memory-bytes`; the engine's token figure scales with the context value) |
+| Context length | **1,048,576 (1M)** — verified by deep-prefill admission to ~900K at the shipped batch width |
+| Concurrency at 1M ctx | **~3×** |
+| Concurrency at 512K ctx | **~4.5×** |
+| Cold boot (load→health) | ~5–6 min (kernel autotune off; ~200 s of that is the weight load) |
+| Temp-0 determinism | identical across runs for most prompts (gate 2). A narrow tie class exists: prompts whose forced answer has an equally-likely variant (a trailing period, a formatting choice) can flip across boots and warm/cold states at temp 0 — measured on three postures, unchanged by context or scheduler knobs. Treat single-word temp-0 outputs as acceptance checks, not correctness proofs. The long-prompt path is a separate gate (9). |
 | Tool calling (deepseek_v41) | working |
 | Reasoning parser (deepseek_v41) | working |
 
@@ -145,44 +153,44 @@ no spec decode, engram on NVMe):
 
 ### Where the boot time goes
 
-The cold boot above is ~12 minutes, and the weight load is ~200 s of it.
-The balance is the **b12x GEMM autotune** — estimated from those two
-figures, not separately timed: the engine compiles a plan of
-several thousand kernels for the shapes this model and this batch width
-produce, and the boot log shows each shape starting from
-`0 cached, 0 compilations`.
+The cold boot above is ~5–6 minutes, and the weight load is ~200 s of
+it. The shipped configuration runs the b12x kernel autotune **off**
+(`B12X_AUTOTUNE=0`): the tuned alternative benchmarks kernel plans for
+every shape this model and batch width produce, and its tuning arena
+self-budgets at **half of free memory** — which has OOM-killed boots on
+this unified-memory kernel, where `MemAvailable` can read as zero and
+nothing self-limits. With autotune off, plans fall back to validated
+heuristic defaults shipped as prebuilt cubins: boots run in roughly half
+the tuned time, decode speed is unchanged (measured), and the cost is a
+**one-time cold-prefill penalty of a few percent per new document**
+(prefix-cache hits — the bulk of real traffic — are unaffected). Set
+`B12X_AUTOTUNE=1` only with a specific reason.
 
-The compiled artifacts are cached under `/root/.cache/b12x` — **inside the
-container's writable layer**, which is discarded when the container is
-recreated. The cache therefore never survives a boot, and every boot pays
-the full compile.
+A second tuner (the fork's FlashInfer autotune) is independent of that
+switch and can be disabled separately with
+`--no-enable-flashinfer-autotune`; on this model and pin it benchmarked
+zero configurations (its log line reads `Saved 0 configs`), so removing
+it is boot hygiene, not a speed lever.
 
-Two knobs in the pinned build can change that, and this recipe sets
-neither: `VLLM_USE_AOT_COMPILE` and `VLLM_USE_MEGA_AOT_ARTIFACT` (both
-default off; upstream's own vision recipe sets both). No AOT artifact is
-baked into the image, so enabling them changes *what is compiled*, not
-*what is reused* — persistence still has to come from a mount that
-outlives the container.
-
-What this recipe does **not** do is raise the compile parallelism. More
-compile workers is the tempting answer and the wrong one: a wider batch
-width has already been observed to kill the worker ranks during the
-compile phase, and the compile-time memory spike on unified memory is
-what makes that happen. A cache hit reduces both the boot time and that
-risk; more workers increase the second.
-
-Enabling any of this needs a measurement across two boots, and it needs
-the cache keyed by the image build stamp — a stale artifact is a *wrong
-kernel*, which is a worse failure than a slow boot. That is an operator
-experiment on a lane, not a desk change, so the recipe documents the
-knobs and leaves the default alone.
+What remains uncached is the compile of new *shapes*: raising
+`MAX_NUM_BATCHED_TOKENS` (or any knob that creates new kernel shapes)
+re-pays compilation on the next boot, and wider shapes have been
+observed to kill worker ranks during the compile phase on this unified
+memory. Two knobs in the pinned build touch compile persistence —
+`VLLM_USE_AOT_COMPILE` and `VLLM_USE_MEGA_AOT_ARTIFACT` (on current
+torch both default **on**; no AOT artifact is baked into the image, so
+enabling them changes *what is compiled*, not *what is reused*).
+Persistence would have to come from a mount keyed by the image build
+stamp — a stale artifact is a *wrong kernel*, which is a worse failure
+than a slow boot — so this recipe ships neither knob changed.
 
 ## Why capacity over speed
 
 The community SGLang recipe for this model on the same hardware
 achieves ~51 tok/s but with a 750K KV pool and 262K context. This
-recipe achieves roughly 2M KV tokens at 512K context — **more than double
-the capacity** — at ~29 tok/s.
+recipe carries roughly four times the pool at 1M context — at ~29
+tok/s, with short-request TTFT protected by the parallel-prefill
+policy.
 
 For workloads that are context-bound (RAG with large knowledge bases,
 long legal or research documents, multi-turn conversations with massive
@@ -195,11 +203,12 @@ The trade-off table:
 
 | | This recipe (vLLM) | Community SGLang |
 |---|---|---|
-| KV pool | **~2M tokens** | 750K tokens |
-| Context | **512K** | 262K (their "256k limit") |
-| Concurrency @ 262K | **~6–9×** | ~2.9× (derived) |
+| KV pool | **~3.1M tokens at 1M ctx** (same 4 GiB reservation reads ~2.4M at 512K) | 750K tokens |
+| Context | **1M** | 262K (their "256k limit") |
+| Concurrency @ 1M | **~3×** | — |
 | Speed | 29 tok/s | **51 tok/s** |
-| Spec decode | off (capacity) | on (speed) |
+| Short TTFT beside deep prefills | **< 5 s** (parallel prefills) | not published |
+| Spec decode | off (rejected — see below) | on (speed) |
 | Engine | vLLM (eugr b12x) | SGLang (custom) |
 
 ## The bring-up: six walls and their fixes
@@ -264,12 +273,18 @@ daemons, the default 0.92 target fails. Fix: set gmu to 0.85 and run
 
 ### 5. Vocabulary divisibility at TP3
 
-The fork divides the raw vocabulary size (129,280) by the TP world size
-at load. 129,280 % 3 ≠ 0. The fork's runtime TP3 padding handles
-attention heads, o_groups, and drafter experts — but the vocabulary
-check requires the `--served-model-name` to be set (the alias mechanism
-triggers a different code path). Using a single served name (e.g.
-`main`) avoids the issue.
+This model's vocabulary is 129,280, and 129,280 % 3 ≠ 0, and that has to
+be settled before the engine serves. The fork's runtime TP3 padding
+handles attention heads, o_groups and drafter experts, so the checkpoint
+itself is the NATURAL one; the served-name path is the other half, and
+the lane serves a single name (e.g. `main`). The boot gate proves the
+model directory is the original pull before the engine starts.
+
+The assertion that fired during bring-up is not present in the pinned
+build: the only vocabulary-divisibility check in this image is in the
+b12x ngram-embedding path, and it divides a padded vocabulary. Treat the
+single-served-name posture as the requirement — the reason it works is
+not readable in the shipped build.
 
 ### 6. io_uring requires seccomp=unconfined in Docker
 
@@ -322,8 +337,11 @@ NCCL_SOCKET_IFNAME="EDIT_ME_MGMT_IF"
 
 # Memory
 GMU=0.85
-CTX=524288
+CTX=1048576                        # 1M; pool bytes/blocks unchanged by this knob
 KV_CACHE_MEMORY_BYTES=4g
+PAR_PREFILLS=2                     # short-request TTFT beside deep prefills (see FIXLOG);
+PREFILL_POLICY=decode-aware        # requires the count above 1
+B12X_AUTOTUNE=0                    # heuristic cubin plans: ~half boot time, decode parity
 
 # Serving
 PORT=8600
@@ -333,6 +351,9 @@ MAX_NUM_BATCHED_TOKENS=8192       # do not raise without a memory plan: 16384
                                   # OOM-killed both worker ranks during the b12x
                                   # compile phase (see FIXLOG failure mode 9)
 BLOCK_SIZE=256
+LIMIT_MM='{"image": 32}'             # images per prompt: the checkpoint's 32-layer
+                                  # ViT tower is served above 0 (verified live);
+                                  # at 0 the engine stubs the tower (text-only)
 
 # Loader
 LOAD_FORMAT=safetensors
@@ -358,7 +379,7 @@ SERVED_MODEL_NAME=main
 Concurrency here means how many full-length requests fit in the KV pool.
 It is a capacity figure, not a promise about simultaneous streams: the
 shipped `--max-num-seqs 8` caps how many requests are served at once, so
-the higher end of the 262K band describes pool depth, not concurrency.
+the higher end of the band (the ~4.5x figure at 512K) describes pool depth, not concurrency.
 
 ### `BLOCK_SIZE=256` — what it is, and what `/metrics` will say
 
@@ -433,16 +454,17 @@ The launcher sets `VLLM_ENABLE_ROCE_ALLREDUCE=1` and
 `VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB`, matching upstream's own three-node
 recipe. The image also ships a one-shot RoCE collective
 (`B12X_ROCENANTE`) that needs **both** RoCE rails of a link to reach the
-peer. The topology this recipe ships has **one cable per leg**, so that
-collective cannot form. The engine's own log says so and moves on:
+peer. The topology this recipe ships has **one cable per pair of boxes** —
+three cables, each device connected to the other two, and **both** of each
+device's ports in use — so that collective cannot form. The engine's own
+log says so and moves on:
 
 ```
-RoCEnante initialization failed: RoCE all-reduce connect failed:
-rank 0: … 1 of 2 RoCE rails have a link to rank 1 …
+RoCEnante initialization failed: RoCE all-reduce connect failed: rank 0: … 1 of 2 RoCE rails have a link to rank 1 …
 ```
 
-(abridged: the line continues with each rank's local and remote interface
-list.)
+(one line; abridged — it continues with each rank's local and remote
+interface list, and repeats the same failure for the other two ranks.)
 
 and then reports what it engaged instead:
 
@@ -453,9 +475,13 @@ out of potential backends: ['FLASHINFER_PCIE_IPC', 'B12X_PCIE', ...]
 
 (abridged: the engine lists every backend it could have used.)
 
-`B12X_ROCENANTE` is not in that list. The reduction is carried by stock
-NCCL over the same fabric, and it works — every number published in this
-recipe was measured that way.
+`B12X_ROCENANTE` is not among the backends the engine **engaged** — the
+enabled subset is `['PYNCCL']` — though it *does* appear in the potential
+list. That is the whole mechanism: the engine tried the one-shot
+collective, the collective disqualified itself on its own connectivity
+check, and the reduction fell through to stock NCCL over the same fabric.
+It works, and every number published in this recipe was measured that
+way.
 
 None of this is visible from the recipe's command line: the knob is set,
 the collective is absent, and the fallback is silent. So the expectation
@@ -471,23 +497,26 @@ of the engine's own dispatch line and update
 asserts the new one. A fabric change should be a recorded decision rather
 than an unrecorded one.
 
-Note that a second rail per leg is **off NVIDIA's documented topology**:
-their cluster guidance says to use one cable per link, and that connecting
-two devices with two cables will not improve performance. The collective
-needs both rails of a link to reach the same peer, so engaging it means a
-cabling NVIDIA does not recommend. That is a performance experiment to
-run deliberately, with the numbers recorded — not a fix.
-
-This is not a defect to fix in the recipe. The [DGX Spark release
+This is not a defect to fix in the recipe, and there is **nothing to
+re-cable**. The [DGX Spark release
 notes](https://docs.nvidia.com/dgx/dgx-spark/release-notes.html) record
 that NCCL 2.30u1 "has updated support for connecting three DGX Spark
 systems in a ring topology", and NVIDIA's
 [cluster guidance](https://docs.nvidia.com/sync/0.97.6/cluster-assistant.html)
 describes that topology as "three cables for a direct connection in which
 each device connects to the other two" — which is exactly the triangle
-this recipe ships. The stock path is therefore the supported one, and the
-published figures here were measured on it. Enabling the one-shot
-collective is a performance experiment, not a correctness fix.
+this recipe ships, with both of each device's ports used, one toward each
+of the other two boxes.
+
+Engaging the collective would need a **second cable between the same pair
+of boxes**, and that is off NVIDIA's documented topology: their guidance
+says to use "only one cable per link" — a link being a pair of devices, or
+a device and its switch — and that "connecting two devices with two
+cables will not improve performance". So the collective is unreachable on
+the supported topology, the stock path is the supported one, and every
+number published in this recipe was measured on it. Engaging the one-shot
+collective would be a performance experiment against NVIDIA's own
+guidance — not a fix.
 
 ### Re-audit triggers
 
@@ -508,8 +537,9 @@ collective is a performance experiment, not a correctness fix.
 ## Hardware
 
 Three NVIDIA DGX Spark (GB10, 121.69 GiB unified CPU/GPU memory each),
-wired as a full CX-7 RoCE triangle (one /24 subnet per leg, 200G per
-link, MTU 9000) plus a management LAN for SSH and API access.
+wired as a full CX-7 RoCE triangle (one /24 subnet per pair of boxes —
+one cable per pair, 200G per cable, MTU 9000) plus a management LAN for SSH and
+API access.
 
 Per-node memory budget at the shipped configuration:
 
@@ -575,18 +605,64 @@ is no further work to do here. If a smaller checkpoint is ever wanted, an
 FP8 subset or a lower-bitpoint variant, that is a checkpoint question and
 it would change the arithmetic; it is not a prefetch question.
 
-## Speculative decode: tested and rejected
+## Vision: built in, one flag
 
-DSpark speculative decoding (k=5) was tested and rejected on capacity
-grounds. The draft model adds ~3 GiB per rank, which at TP3 leaves
-insufficient memory for the KV pool and CUDA graphs — the boot OOMs at
-every gmu and KV combination tried (0.83/0.85 × 1g/2g). The trade:
-~51 tok/s (community SGLang number with spec decode) vs 29 tok/s, at
-the cost of the KV pool and the context length — the draft model does
-not fit beside this pool. (That is a trade against *this* recipe's own
-capacity with spec decode off; against the community's 750K pool this
-recipe still carries more than double.) For context-bound
-workloads, the capacity is worth more than the speed.
+The 1017 checkpoint carries a 32-layer ViT tower, and the fork ships the
+matching image processor inside itself — constructed from the model
+config, no `preprocessor_config.json` required. The engine loads the
+multimodal class unconditionally on this hardware and builds the tower;
+setting `LIMIT_MM` above zero turns it from stubbed to served:
+
+```sh
+LIMIT_MM='{"image": 32}'  # images per prompt; 0 = text-only. Verified: a 12-image
+                          # ordered identification at 12/12 correct (~4 s); a full 32-image
+                          # batch processes in ~4 s (~185 tokens/image after downsampling).
+                          # Per-image identification stays strong at the limit; aggregate
+                          # counting drifts (30/32) — a known VLM scale behavior
+```
+
+Verified live: exact shape/color/position recovery on a generated test
+image through the OpenAI-compatible endpoint (`image_url` with a data
+URL); a 12-image ordered identification scored 12/12 in ~4 s; a full
+32-image batch processes in ~4 s (~185 tokens per image after
+downsampling — small images cost far less than the 1,024-token cap).
+Text decode speed unchanged (250 tokens in ~8.5-9 s) and the KV pool
+unchanged. One VLM-scale caveat: per-image identification stays strong
+at the limit, but aggregate counting drifts (a 32-image batch was
+counted as 30).
+
+## Speculative decode: tested and rejected, finally
+
+DSpark speculative decoding was tested across **six boots** covering
+every knob-accessible configuration, and the rejection is final — but
+the mechanism is not the one the first capacity reading suggested, and
+the distinction matters for anyone re-trying it:
+
+1. **The drafter itself is cheap and correct**: ~3 GiB per rank resident,
+   loads in seconds, and the k=3 capture ladder is a fraction of k=5's.
+2. **The early boot OOMs were the kernel tuners, not the drafter.** The
+   b12x autotune arena (which self-budgets at half of free memory) and
+   the fork's FlashInfer autotuner each killed boots that now complete:
+   with `B12X_AUTOTUNE=0` and `--no-enable-flashinfer-autotune`, a spec
+   boot at a reduced 2.3 GiB KV pool **allocates the pool, captures its
+   CUDA graphs, and serves** — the first spec boot on this hardware to
+   get that far.
+3. **The real wall is steady state, and it is fatal.** Roughly a minute
+   into its first deep-context prefill (a few hundred K tokens — exactly
+   the RAG shape this recipe exists for), the head rank was
+   kernel-OOM-killed: the drafter's ~3 GiB/rank residency leaves the
+   head unable to absorb the deep-prefill memory transient at any pool
+   that leaves the drafter room. Smaller pools cut concurrency toward
+   the 50% line without adding headroom; the failure is the prefill
+   transient, not a per-sequence buffer.
+
+The conclusion: on this pin, DSpark cannot serve this recipe's own
+deep-context workload at any knob setting. Reopening it requires more
+memory per rank (a 64 KiB-page kernel, the display carve-out) or a
+smaller *trained* drafter — engine/OS projects, not flags. The
+zero-weight alternative (n-gram prompting off the request's own tokens)
+is untested here and is the only spec-adjacent direction that does not
+carry the drafter's residency.
 
 ## Comparison with other V4.1-Flash recipes
 
@@ -598,7 +674,7 @@ landscape, not to claim a win.
 
 | Recipe | Engine | TP | Image | KV pool | Context |
 |---|---|---|---|---|---|
-| **This one** | vLLM (b12x fork), native weights | **3** | **public Docker Hub, digest-pinned** | **~2M tokens** | **512K** |
+| **This one** | vLLM (b12x fork), native weights | **3** | **public Docker Hub, digest-pinned** | **~3.1M tokens at 1M ctx** | **1M** |
 | [MiaAI-Lab](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks) | SGLang | 3 (a 4-node line too) | SGLang base pinned by digest + a local overlay | 750K tokens (TP3) | 256K limit (TP3) |
 | [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f) | vLLM (custom fork) | 3 or 4 | built from the repo; one image serves every shape | 1.3M–5.5M (TP3) – 11.6M (TP4) tokens | 256K (TP3, 4k) / 1M (TP3, TP4) |
 | [tonyd2wild](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-TP2-and-TP4-DGX-Sparks) | TensorFold (a Zig engine); older vLLM lanes | 2 or 4 | engine built from source | 1.05M (TP2) – 29M positions | 300K – 1M |
@@ -631,7 +707,7 @@ Where the two differ:
 | `--gpu-memory-utilization` | `0.85` | `0.87` |
 | `--max-num-seqs` | `8` | `2` |
 | `--max-num-batched-tokens` | `8192` | `4096` |
-| `--max-model-len` | `524288` | `auto` |
+| `--max-model-len` | `1048576` | `auto` |
 | speculative decode | off | dspark, 7 tokens |
 | `--load-format` | `safetensors` | `b12x` |
 | linear / MoE / attention backend | unset — the engine's own policy | pinned `b12x` ×3 |
@@ -639,7 +715,7 @@ Where the two differ:
 Two rows are the recipe's whole thesis, and they pull in opposite
 directions from upstream's: upstream asks for **8× less KV cache** and **4×
 fewer concurrent sequences**, with the context derived from that smaller
-pool, which is a speed-shaped lane. This recipe asks for a **large pool and a pinned 512K
+pool, which is a speed-shaped lane. This recipe asks for a **large pool and a pinned 1M
 context**, which is a capacity-shaped lane, and accepts roughly 29 tok/s
 for that.
 

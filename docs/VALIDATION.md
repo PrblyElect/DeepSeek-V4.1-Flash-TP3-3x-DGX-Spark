@@ -2,7 +2,7 @@
 
 Acceptance gates for the shipped configuration. Run after every boot.
 
-**Where each gate runs.** Gates 1–5 and gate 9 are plain HTTP and run
+**Where each gate runs.** Gates 1–5, gate 9 and gate 10 are plain HTTP and run
 from anywhere that can reach the head box. Gates 6–8 shell out to the
 local `docker` binary and must run **on the head box**, in the staged
 directory (`~/ds41-flash-tp3/`), where the container actually lives:
@@ -49,6 +49,17 @@ runs as a piecewise CUDA graph, so gate 9 is the one that reaches it.
 Run both; this gate alone is not evidence that the long-prompt path is
 correct.
 
+**A known tie class, measured.** Pick prompts whose forced answer has no
+equally-likely variant. A prompt like "reply with the single word:
+received" sits on a genuine two-way tie (`received` vs `received.`) at
+temp 0, and individual samples can flip between boots and between cold
+and warm cache states — measured on three different postures (context
+and scheduler knobs do not change it; the *proportion* of flipped
+samples is small and the variants are always near-ties of the same
+answer, never garbage). If this gate fails, inspect the outputs before
+concluding anything: identical-flavored variants of one answer are this
+documented class, not a serving defect.
+
 ## 3. Strict JSON compliance
 
 ```sh
@@ -83,8 +94,9 @@ time curl -s http://HEAD_IP:8600/v1/chat/completions \
 
 ```sh
 docker logs ds41-flash-tp3 2>&1 | grep "GPU KV cache size"
-# expected: roughly 1.6M-2.4M tokens (the pool is boot-labile), and a
-# concurrency figure of roughly 3-4.7x at a 524,288-token context
+# expected: roughly 2.4M-3.1M tokens depending on the context value (the
+# pool's byte reservation and block count are the invariant -- quote those),
+# and a concurrency figure of roughly 3x at a 1,048,576-token context
 ```
 
 ## 7. Image identity
@@ -139,22 +151,27 @@ break.
 The launcher sets `VLLM_ENABLE_ROCE_ALLREDUCE=1`, and the image ships a
 one-shot RoCE collective (`B12X_ROCENANTE`) that needs both RoCE rails of
 a link to reach the peer. The topology this recipe ships has one cable
-per leg, so that collective cannot form: the engine logs the failure and
-engages `PYNCCL` instead. The gate asserts the transport that **actually
-engaged**, on every group the engine reports, against
-`resolved_backends.expect.allreduce_backend` in the manifest.
+per **pair of boxes** — three cables, each device connected to the other
+two, and both of each device's ports in use — so that collective cannot
+form: the engine logs the failure and engages `PYNCCL` instead. The gate
+asserts the transport that **actually engaged**, on every group the
+engine reports, against `resolved_backends.expect.allreduce_backend` in
+the manifest.
 
 On the shipped topology the expected value is `PYNCCL`, and the published
-figures were all measured on that path.
+figures were all measured on that path. There is nothing to re-cable:
+engaging the collective would need a second cable between the same pair
+of boxes, which NVIDIA's own
+[cluster guidance](https://docs.nvidia.com/sync/0.97.6/cluster-assistant.html)
+says "will not improve performance".
 
-If you re-cable a second rail per leg, this gate will **fail**, and it is
-meant to: the engine will engage the collective, and the expectation now
-describes a lane that no longer exists. Update
+If the transport ever changes, this gate will **fail**, and it is meant
+to: the expectation now describes a lane that no longer exists. Read the
+transport out of the engine's dispatch line and update
 `launch/tp3-kit/engine-identity.json`
-(`resolved_backends.expect.allreduce_backend`) to `B12X_ROCENANTE` at the
-same time, and the gate then asserts the new transport. The failure
-message prints the engine's own diagnostic so the reason is in front of
-you rather than inferred.
+(`resolved_backends.expect.allreduce_backend`) to match, and the gate
+then asserts the new transport. The failure message prints the engine's
+own diagnostic so the reason is in front of you rather than inferred.
 
 Every expectation is read from the engine's own startup log, its own
 `/metrics` and its own resolved config — and the one expectation that is
@@ -202,5 +219,25 @@ accepting, not against one carrying production traffic.
 
 ## Pass criteria
 
-All nine gates must pass. A failed gate is diagnosed forward from the
+All gates must pass. A failed gate is diagnosed forward from the
 FIXLOG, never rolled back automatically.
+
+## 10. Vision round-trip (requires LIMIT_MM > 0)
+
+Send a generated image with known content and require specific recovery:
+
+```sh
+python3 -c "from PIL import Image, ImageDraw; import base64, io; \
+  img = Image.new('RGB', (300, 150), (30, 60, 200)); d = ImageDraw.Draw(img); \
+  d.polygon([(40, 120), (150, 20), (260, 120)], fill=(255, 220, 0)); \
+  d.rectangle([180, 90, 280, 140], fill=(220, 30, 30)); \
+  buf = io.BytesIO(); img.save(buf, 'PNG'); \
+  print(base64.b64encode(buf.getvalue()).decode())" > /tmp/img.b64
+B64=$(cat /tmp/img.b64)
+curl -s http://HEAD_IP:8600/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"main\",\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,$B64\"}},{\"type\":\"text\",\"text\":\"Describe the shapes, colors and positions.\"}]}],\"max_tokens\":400,\"temperature\":0,\"chat_template_kwargs\":{\"thinking\":false}}" | \
+  jq -r '.choices[0].message.content'
+# expected: the description names a yellow triangle (apex up) and a red
+# rectangle (lower right) on a blue background
+```
