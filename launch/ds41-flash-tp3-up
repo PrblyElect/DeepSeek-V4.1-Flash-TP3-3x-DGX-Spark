@@ -173,7 +173,7 @@ do_start() {
       setsid nohup bash start-tp3-fork.sh > /tmp/ds41-boot-w2.log 2>&1 &
   " || die "worker B launch failed"
 
-  say "start: all three launched; health in ~10–12 min"
+  say "start: all three launched; health in ~5–6 min"
   say "  check: curl http://$HEAD_IP:$PORT/health"
 }
 
