@@ -87,7 +87,7 @@ time curl -s http://HEAD_IP:8600/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"main","messages":[{"role":"user","content":"Write a detailed paragraph about ocean currents."}],"max_tokens":250,"temperature":0}' | \
   jq '.usage.completion_tokens'
-# expected: 250 tokens in ~8.5–9 s (~29 tok/s)
+# expected: 250 tokens in ~8 s (~31 tok/s)
 ```
 
 ## 6. KV pool (from boot log)
@@ -122,8 +122,8 @@ the container.
 
 ## 8. Resolved backends and the activation limit
 
-The command line is not the behaviour: the engine chooses its MoE
-backend, dense-linear kernel and attention backend itself. This gate
+The command line is not the behaviour: the engine chooses its dense-linear
+kernel and attention backend itself. This gate
 checks what it resolved to, against the contract in
 `launch/tp3-kit/engine-identity.json`:
 
@@ -135,7 +135,7 @@ python3 tp3-kit/verify-resolved-backends.py --container ds41-flash-tp3
 # expected: RESOLVED-BACKENDS PASS
 ```
 
-It fails if the MoE backend is the b12x one (that path drops the model's
+It fails if the tiny-decode kill switch is off (`B12X_W4A8_TINY_DECODE` != 0 — that path drops the model's
 clamped-SwiGLU limit on small-batch decode, with no error signal), if the
 engine resolved a different activation limit, if the TP=3 head padding is
 not in effect, if the resolved block sizes do not match the contract, or

@@ -2,10 +2,11 @@
 """verify-resolved-backends.py — check the engine RESOLVED the behaviour this
 recipe was validated against.
 
-WHY THIS EXISTS. The command line is not the behaviour. The MoE backend, the
-dense-linear kernel and the attention backend are all chosen by the engine's
-own policy, and a new upstream image can change them without changing a
-single flag the recipe passes. A reader who checks the command line and sees
+WHY THIS EXISTS. The command line is not the behaviour. The dense-linear
+kernel and the attention backend are chosen by the engine's own policy —
+and the MoE backend's resolution still has to be proven even though the
+launcher pins it — and a new upstream image can change them under the
+recipe's command line. A reader who checks the command line and sees
 nothing wrong has proved nothing about the kernels that actually ran.
 
 The boot gate (boot-gate-fork.py) proves the ENGINE is the audited build:
@@ -57,7 +58,14 @@ DEFAULT_MANIFEST = os.path.join(HERE, "engine-identity.json")
 LOG_MARKERS = {
     "moe_backend": "Using '{v}' Mxfp4 MoE backend.",
     "dense_linear_kernel": "Using {v} for MXFP8 GEMM",
-    "attention_backend": "{v} ready attention.dsa_indexer",
+    # The indexer's readiness line changed shape when the FlashInfer
+    # autotuner was shipped OFF: the "b12x ready ... N/N"
+    # form only printed at the end of a tuning pass, and with tuning
+    # stopped the reporter emits the heuristic-warmup form instead. Both
+    # are the b12x readiness reporter naming its backend — value-bearing
+    # either way — and the emitter file is hash-pinned, so the marker
+    # cannot be reformatted out from under this check.
+    "attention_backend": "{v} warming heuristics attention.dsa_indexer",
     "tp3_head_pad": "Padded DeepSeek V4.1 attention for TP3: {v}",
     "spec_decode": "speculative_config={v}",
     "load_format": "load_format={v}",
@@ -67,12 +75,12 @@ LOG_MARKERS = {
 
 # Log markers that must be ABSENT (see the manifest's `forbidden` block).
 #
-# The default for `moe_backend` is the PREFIX of the MoE enum name, and that
-# is load-bearing: the all-reduce dispatch prints the quoted names
-# 'B12X_PCIE' and 'B12X_ROCENANTE' in the same log, so a bare family-name
-# match would fail on a healthy lane.
 FORBIDDEN_MARKERS = {
-    "moe_backend": "'B12X_MXFP4",
+    # The b12x MoE prefix marker was RETIRED: the b12x backend is
+    # now the EXPECTED one (see the manifest), and the clamp hazard the
+    # marker guarded moved to the tiny-decode env, asserted via
+    # ENV_MARKERS below -- a missing env fails the check loudly. The
+    # NvFp4 forbid stays: that backend remains wrong for this model.
     "nvfp4_moe_backend": "NvFp4 MoE backend",
 }
 
@@ -141,6 +149,11 @@ CONFIG_KEYS = ("swiglu_limit",)
 # evidence (see ENV_MARKERS).
 CMD_MARKERS = {
     "requested_block_size": "--block-size",
+    # No CLI flag exists for the tiny-decode kill switch; the entry exists
+    # so the check loop runs for this key, and the ENV branch (above)
+    # always resolves it. If the env were absent, the cmd fallback would
+    # find no literal and fail loudly -- the intended direction.
+    "tiny_decode_env": "--b12x-w4a8-tiny-decode",
 }
 
 # The container's ENVIRONMENT carries the resolved value of a knob the
@@ -159,6 +172,11 @@ CMD_MARKERS = {
 # because there the text IS the value.
 ENV_MARKERS = {
     "requested_block_size": "BLOCK_SIZE",
+    # The clamp check that replaced the retired b12x-MoE forbid: the env
+    # must read exactly "0". Anything else -- including the image default
+    # ("1", tiny-decode ON, clamp dropped) -- fails. There is no CLI flag
+    # for this knob, so the env is the only honest source.
+    "tiny_decode_env": "B12X_W4A8_TINY_DECODE",
 }
 
 

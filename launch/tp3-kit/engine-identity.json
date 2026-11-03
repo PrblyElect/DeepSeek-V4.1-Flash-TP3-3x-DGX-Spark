@@ -61,9 +61,9 @@
     "text_config.swiglu_limit.why": "The clamped-SwiGLU limit for the routed experts. The chain is: model config -> DeepseekV41Config.swiglu_limit -> the inherited DeepseekV4 MoE class -> RoutedExperts.swiglu_limit -> the MXFP4 quant method -> gemm1_clamp_limit -> the kernel's clamp_limit. If any link stops carrying it, every decode step silently uses unclamped SwiGLU with no error signal."
   },
   "resolved_backends": {
-    "why": "What the engine RESOLVES, which is not the same as the flags the recipe passes: the MoE backend, the dense-linear kernel and the attention backend are all selected by the engine's own policy, and a rebase can change them without changing the recipe's command line. The code that resolves them is hash-pinned under `files`; these are the values that resolution must produce. Checked by verify-resolved-backends.py after the engine is up.",
+    "why": "What the engine RESOLVES, which is not the same as the flags the recipe passes: the dense-linear kernel and the attention backend are selected by the engine's own policy \u2014 and the MoE backend's resolution still has to be proven even though the launcher pins it \u2014 and a rebase can change what the recipe's command line resolves. The code that resolves them is hash-pinned under `files`; these are the values that resolution must produce. Checked by verify-resolved-backends.py after the engine is up.",
     "expect": {
-      "moe_backend": "DEEPGEMM_MXFP4",
+      "moe_backend": "B12X_MXFP4_MXFP8",
       "dense_linear_kernel": "FlashInferCutlassMxfp8LinearKernel",
       "attention_backend": "b12x",
       "tp3_head_pad": "heads 64 -> 72, output groups 8 -> 9",
@@ -76,10 +76,11 @@
       "enable_prefix_caching": "True",
       "sliding_window": "128",
       "max_num_batched_tokens": 8192,
-      "allreduce_backend": "PYNCCL"
+      "allreduce_backend": "PYNCCL",
+      "tiny_decode_env": 0
     },
     "expect.why": {
-      "moe_backend": "The MXFP4 experts run through the DeepGEMM FP4 path, which carries the clamped-SwiGLU limit into the kernel.",
+      "moe_backend": "The b12x MXFP4 MoE backend, measured and kept: ~31 tok/s solo decode, clean 4-stream parity, prefill in band, trough ~2.8 GB.",
       "attention_backend": "The b12x attention kernels are the ones that run: the DSA indexer and the compressed-sparse MLA kernels are compiled and primed by the b12x autotuner at warmup. The marker is value-bearing, so a different attention backend cannot pass it by accident.",
       "tp3_head_pad": "The fork's TP=3 head surgery, applied at engine-config time. Upstream vLLM refuses TP=3 for this model (64 attention heads do not divide by 3); the fork pads to 72 heads in 9 output groups instead. This marker proves the surgery is live, and it is emitted by a file the manifest hash-pins.",
       "scheduler_block_size": "The requested block size; the engine logs the LCM of the KV groups' block sizes.",
@@ -88,11 +89,10 @@
       "enable_prefix_caching": "On by default in this build, so the sliding-window replay path is live on a request that hits the cache. The long-prompt gate checks that a cache hit does not change the decode logprobs.",
       "sliding_window": "DS-V4.1's sliding-window size; 128 is what puts the sliding-window group on the 128 block size.",
       "max_num_batched_tokens": "The chunked-prefill boundary. The long-prompt correctness gate builds a prompt that crosses it, because upstream vLLM #62811 shows the failure lives in the LAST chunk of a chunked prefill when it runs as a piecewise CUDA graph -- a short prompt never reaches it.",
-      "allreduce_backend": "WHICH ALL-REDUCE ACTUALLY ENGAGED. The recipe sets VLLM_ENABLE_ROCE_ALLREDUCE=1 and VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB, and the image ships a one-shot RoCE collective (B12X_ROCENANTE) that needs BOTH RoCE rails of every link to reach the peer. The shipped topology is one cable per PAIR OF BOXES -- three cables, each device connected to the other two, both of each device's ports in use -- so on that topology the collective cannot form, the engine falls through, and PYNCCL carries the reduction -- and the recipe would otherwise say nothing about it. Pinning the EXPECTED value turns a silent fallback into a check: a reader who adds a second cable between the same pair of boxes gets a FAIL here until they update this expectation to B12X_ROCENANTE, which is the point -- the fabric change is then a gated event rather than an unrecorded one. The engine prints the choice as \"Using ['<backend>'] all-reduce backends (in dispatch order) for group 'tp:0' out of potential backends: [...]\"."
+      "allreduce_backend": "WHICH ALL-REDUCE ACTUALLY ENGAGED. The recipe sets VLLM_ENABLE_ROCE_ALLREDUCE=1 and VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB, and the image ships a one-shot RoCE collective (B12X_ROCENANTE) that needs BOTH RoCE rails of every link to reach the peer. The shipped topology is one cable per PAIR OF BOXES -- three cables, each device connected to the other two, both of each device's ports in use -- so on that topology the collective cannot form, the engine falls through, and PYNCCL carries the reduction -- and the recipe would otherwise say nothing about it. Pinning the EXPECTED value turns a silent fallback into a check: a reader who adds a second cable between the same pair of boxes gets a FAIL here until they update this expectation to B12X_ROCENANTE, which is the point -- the fabric change is then a gated event rather than an unrecorded one. The engine prints the choice as \"Using ['<backend>'] all-reduce backends (in dispatch order) for group 'tp:0' out of potential backends: [...]\".",
+      "tiny_decode_env": "B12X_W4A8_TINY_DECODE=0 disables the b12x tiny-decode path whose small-batch SwiGLU drops the clamp; with it off, the general kernel receives the clamp through plan_weights. This env is the binding clamp check now that b12x is the expected backend."
     },
     "forbidden": {
-      "moe_backend": "'B12X_MXFP4",
-      "moe_backend.why": "The b12x fused-MoE tiny-decode path (one to four tokens per step) computes SwiGLU with no clamp, so the model's 10.0 limit is dropped and every low-batch decode step is quietly wrong. The path is present in the image's flashinfer; it is dormant only because the engine resolves DEEPGEMM_MXFP4. Switching the MoE backend to b12x would turn this on with no error signal, so the check fails loudly instead. The marker is the PREFIX of the quoted MoE enum name: the engine's enum names are B12X_MXFP4_MXFP8 and B12X_MXFP4_BF16, so the prefix covers both. The all-reduce dispatch also lists B12X_PCIE and B12X_ROCENANTE, which are not MoE backends and must not trip this -- hence the prefix is the MoE name and not the bare family name.",
       "nvfp4_moe_backend": "NvFp4 MoE backend",
       "nvfp4_moe_backend.why": "The CUTLASS NVFP4 MoE path finalises expert outputs with atomics, so identical requests give different logits on this hardware. It is not the backend this recipe selects."
     }
