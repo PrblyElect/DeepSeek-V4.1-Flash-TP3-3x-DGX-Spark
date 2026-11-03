@@ -260,6 +260,7 @@ exec vllm serve /model \
   --max-num-batched-tokens "${MNBT}" \
   ${SPEC_FLAG} \
   ${PREFILL_FLAGS} \
+  --no-enable-flashinfer-autotune \
   --no-enable-log-requests \
   --enable-auto-tool-choice --tool-call-parser "${TOOL_CALL_PARSER:-deepseek_v41}" \
   --reasoning-parser "${REASONING_PARSER:-deepseek_v41}" \
@@ -434,6 +435,7 @@ run_args=(
   -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"
   -e PORT="$PORT" -e TP="$TP" -e GMU="$GMU" -e CTX="$CTX" -e MNBT="$MNBT" -e LIMIT_MM="$LIMIT_MM" -e SPEC_CFG="$SPEC_CFG"
   -e PAR_PREFILLS="$PAR_PREFILLS" -e PREFILL_POLICY="$PREFILL_POLICY"
+  -e MALLOC_ARENA_MAX=2
   -e EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS"
   -v "$MODEL_DIR:/model:ro"
   -v "$KIT_DIR:/kit:ro"
@@ -456,6 +458,15 @@ if [ "${PRINT_CMD:-0}" = "1" ]; then
   printf '\n'
   echo "[ds41-fork] PRINT_CMD — container NOT started"
   exit 0
+fi
+
+# Best-effort page-cache drop before the load (the startup free-memory
+# wall's own fix): trims the load trough on unified memory. Non-fatal
+# when passwordless sudo is unavailable — the manual command is wall 4.
+if sudo -n sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' 2>/dev/null; then
+  echo "[ds41-fork] page cache dropped pre-boot"
+else
+  echo "[ds41-fork] drop_caches SKIPPED (no passwordless sudo) — run wall 4's command manually before booting"
 fi
 
 start_probe &

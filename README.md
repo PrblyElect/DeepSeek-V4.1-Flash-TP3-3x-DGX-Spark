@@ -167,10 +167,12 @@ the tuned time, decode speed is unchanged (measured), and the cost is a
 `B12X_AUTOTUNE=1` only with a specific reason.
 
 A second tuner (the fork's FlashInfer autotune) is independent of that
-switch and can be disabled separately with
-`--no-enable-flashinfer-autotune`; on this model and pin it benchmarked
+switch and the shipped launcher disables it too
+(`--no-enable-flashinfer-autotune`): on this model and pin it benchmarked
 zero configurations (its log line reads `Saved 0 configs`), so removing
-it is boot hygiene, not a speed lever.
+it is boot hygiene, not a speed lever. The launcher also drops the page
+cache before the load (best-effort, requires passwordless sudo — the
+manual command is wall 4) and caps the engine's glibc malloc arenas at 2.
 
 What remains uncached is the compile of new *shapes*: raising
 `MAX_NUM_BATCHED_TOKENS` (or any knob that creates new kernel shapes)
@@ -268,8 +270,10 @@ and memory management, not its loader — the loader is swappable.
 
 The fork checks available GPU memory at startup against the requested
 utilization fraction. On a busy head node with even 2 GiB of extra
-daemons, the default 0.92 target fails. Fix: set gmu to 0.85 and run
-`echo 3 > /proc/sys/vm/drop_caches` before boot.
+daemons, the default 0.92 target fails. Fix: set gmu to 0.85 — the
+launcher drops the page cache before every boot (best-effort, needs
+passwordless sudo; otherwise run `sync; echo 3 > /proc/sys/vm/drop_caches`
+manually).
 
 ### 5. Vocabulary divisibility at TP3
 
@@ -367,6 +371,8 @@ NCCL_MAX_NCHANNELS=8
 
 # Allocator
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+# the launcher also forwards MALLOC_ARENA_MAX=2 to the engine
+# (see "Where the boot time goes")
 
 # Parsers
 TOOL_CALL_PARSER=deepseek_v41
