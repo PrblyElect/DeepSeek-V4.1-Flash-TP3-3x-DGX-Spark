@@ -169,6 +169,26 @@ NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
 # kernel MemAvailable can read zero — so it never self-limits, and the
 # elastic transient kernel-OOM-killed early boots. Set "=1" to restore
 # per-shape benchmarking only with a specific reason.
+# b12x MoE tiny-decode kill switch — CORRECTNESS-CRITICAL, default 0:
+# the tiny-decode path checks num_tokens/k/n/activation but NOT
+# swiglu_limit, so with it enabled ("1") this model's clamped-SwiGLU
+# limit is silently dropped on small-batch decode. 0 forces the general
+# kernel, which receives the clamp through plan_weights. Only relevant
+# when the MoE backend is b12x; harmless otherwise.
+B12X_W4A8_TINY_DECODE="${B12X_W4A8_TINY_DECODE:-0}"
+# MoE backend — DEFAULT b12x, measured and kept: ~31 tok/s
+# solo, clean 4-stream parity, prefill at the top of its band, trough
+# under 3 GB, zero memory cost — vs DeepGEMM's ~29 band. The kill
+# switch above is REQUIRED with this backend (the general kernel carries
+# the SwiGLU clamp; tiny-decode drops it). Set empty ("") to restore the
+# engine's auto resolution (DEEPGEMM_MXFP4).
+MOE_BACKEND="${MOE_BACKEND:-b12x}"
+# Scheduler step-cap companion (env-only knob; no CLI form): when
+# --max-num-scheduled-tokens caps a step budget, "1" leaves PREFILL-ONLY
+# steps at the full MNBT (solo/uncontended prefill unchanged) while mixed
+# prefill+decode steps take the cap — the decode-under-prefill lever.
+# Default 1: with no step cap set, the value is inert.
+VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS="${VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS:-1}"
 B12X_AUTOTUNE="${B12X_AUTOTUNE:-0}"
 PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
 KIT_DIR="$(cd "$(dirname "$0")/tp3-kit" && pwd)"
@@ -239,6 +259,10 @@ PREFILL_FLAGS=""
 if [ "${PAR_PREFILLS:-1}" != "1" ]; then
   PREFILL_FLAGS="--max-parallel-prefills ${PAR_PREFILLS} --prefill-policy ${PREFILL_POLICY}"
 fi
+MOE_FLAG=""
+if [ -n "${MOE_BACKEND:-}" ]; then
+  MOE_FLAG="--moe-backend ${MOE_BACKEND}"
+fi
 exec vllm serve /model \
   --load-format "${LOAD_FORMAT:-safetensors}" \
   --engram-config "${ENGRAM_CONFIG}" \
@@ -260,6 +284,7 @@ exec vllm serve /model \
   --max-num-batched-tokens "${MNBT}" \
   ${SPEC_FLAG} \
   ${PREFILL_FLAGS} \
+  ${MOE_FLAG} \
   --no-enable-flashinfer-autotune \
   --no-enable-log-requests \
   --enable-auto-tool-choice --tool-call-parser "${TOOL_CALL_PARSER:-deepseek_v41}" \
@@ -430,6 +455,9 @@ run_args=(
   -e VLLM_MXFP8_LM_HEAD=1
   -e VLLM_ENABLE_PCIE_ALLREDUCE=0
   -e B12X_AUTOTUNE="$B12X_AUTOTUNE"
+  -e B12X_W4A8_TINY_DECODE="$B12X_W4A8_TINY_DECODE"
+  -e VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS="$VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS"
+  -e MOE_BACKEND="$MOE_BACKEND"
   -e PYTHONPYCACHEPREFIX=/tmp/pycache
   -e RUNAI_STREAMER_MEMORY_LIMIT=4294967296
   -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"

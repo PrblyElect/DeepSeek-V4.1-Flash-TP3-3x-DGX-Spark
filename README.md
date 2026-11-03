@@ -19,7 +19,7 @@ on a public Docker Hub image. Capacity-optimized: a **4 GiB KV
 reservation** at **1M context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
 block count (roughly 2.4M tokens at 512K, roughly 3.1M at 1M; one full
-1M request fits with room to spare). **~29 tok/s single-stream** (prose,
+1M request fits with room to spare). **~31 tok/s single-stream** (prose,
 no spec decode), and a short request's first token lands in **under five
 seconds even beside a deep multi-hundred-K prefill** (parallel prefills,
 measured — see FIXLOG). Engram n-gram tables are served from NVMe,
@@ -136,7 +136,7 @@ decode, engram on NVMe):
 
 | Metric | Value |
 |---|---|
-| Single-stream decode (prose) | ~29 tok/s |
+| Single-stream decode (prose) | ~31 tok/s (b12x MoE) |
 | TTFT (short prompt, idle) | 1–2 s |
 | TTFT (short prompt beside a deep prefill) | **under 5 s** (was tens of seconds before parallel prefills; the deep prefill itself is unaffected) |
 | Weights per rank | 95.4 GiB |
@@ -190,7 +190,7 @@ than a slow boot — so this recipe ships neither knob changed.
 
 The community SGLang recipe for this model on the same hardware
 achieves ~51 tok/s but with a 750K KV pool and 262K context. This
-recipe carries roughly four times the pool at 1M context — at ~29
+recipe carries roughly four times the pool at 1M context — at ~31
 tok/s, with short-request TTFT protected by the parallel-prefill
 policy.
 
@@ -198,7 +198,7 @@ For workloads that are context-bound (RAG with large knowledge bases,
 long legal or research documents, multi-turn conversations with massive
 history), the KV pool and context length are the binding constraints,
 not generation speed. A 300K-token document is rejected outright at a
-262K context; a 22 tok/s difference in generation speed is invisible when
+262K context; a ~20 tok/s difference in generation speed is invisible when
 streaming at reading speed.
 
 The trade-off table:
@@ -208,7 +208,7 @@ The trade-off table:
 | KV pool | **~3.1M tokens at 1M ctx** (same 4 GiB reservation reads ~2.4M at 512K) | 750K tokens |
 | Context | **1M** | 262K (their "256k limit") |
 | Concurrency @ 1M | **~3×** | — |
-| Speed | 29 tok/s | **51 tok/s** |
+| Speed | ~31 tok/s | **51 tok/s** |
 | Short TTFT beside deep prefills | **< 5 s** (parallel prefills) | not published |
 | Spec decode | off (rejected — see below) | on (speed) |
 | Engine | vLLM (eugr b12x) | SGLang (custom) |
@@ -306,7 +306,7 @@ default seccomp profile blocks. Fix:
 | Image | `eugr/spark-vllm-b12x:nightly-20261015` (digest `sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595`) |
 | Checkpoint | `deepseek-ai/DeepSeek-V4.1-Flash-1017` @ `1bae0e10` (~510 GB) |
 | vLLM | v0.1.dev21830+g8244d1c44 (fork build) |
-| MoE backend | DEEPGEMM_MXFP4 |
+| MoE backend | `B12X_MXFP4_MXFP8` (b12x, with the tiny-decode kill switch on) |
 | Dense GEMM | FlashInferCutlassMxfp8LinearKernel |
 | Model runner | V2 |
 | KV layout | BLHNC |
@@ -350,6 +350,9 @@ B12X_AUTOTUNE=0                    # heuristic cubin plans: ~half boot time, dec
 # Serving
 PORT=8600
 TP=3
+MOE_BACKEND=b12x                      # the measured-keep MoE backend; empty = engine auto
+                                      # (DEEPGEMM_MXFP4). B12X_W4A8_TINY_DECODE=0 below is
+                                      # REQUIRED with b12x — it carries the SwiGLU clamp.
 MAX_NUM_SEQS=8
 MAX_NUM_BATCHED_TOKENS=8192       # do not raise without a memory plan: 16384
                                   # OOM-killed both worker ranks during the b12x
@@ -430,7 +433,7 @@ pass. On this configuration the engine resolves:
 
 | | resolved to |
 |---|---|
-| MoE backend | `DEEPGEMM_MXFP4` (the MXFP4 experts) |
+| MoE backend | `B12X_MXFP4_MXFP8` (the b12x MXFP4 experts; the launcher pins `--moe-backend b12x`) |
 | dense linear | `FlashInferCutlassMxfp8LinearKernel` |
 | attention | b12x (DSA indexer) |
 | TP=3 head padding | 64 heads → 72, in 9 output groups |
@@ -440,9 +443,15 @@ pass. On this configuration the engine resolves:
 
 Two of those are load-bearing and are checked, not assumed:
 
-- the MoE backend must **not** be the b12x one — that path computes
-  SwiGLU with no clamp on the small-batch decode step, so the model's
-  clamped-SwiGLU limit would be silently dropped, with no error signal;
+- the MoE backend IS the b12x one, pinned by the launcher — and the
+  thing that makes that safe is the **tiny-decode kill switch**
+  (`B12X_W4A8_TINY_DECODE=0`, forwarded by the launcher): the b12x
+  MoE's tiny-decode path computes SwiGLU with no clamp on the
+  small-batch decode step, silently dropping the model's clamped-SwiGLU
+  limit. With the switch off, the general kernel runs and receives the
+  clamp. The verifier asserts the switch's resolved value from the
+  container's own environment on every run — the check that used to
+  forbid the backend now guards its safety condition;
 - the model's clamped-SwiGLU limit must still be what the engine
   resolves, because the chain that carries it from the config to the
   kernel is several layers deep.
@@ -632,8 +641,12 @@ image through the OpenAI-compatible endpoint (`image_url` with a data
 URL); a 12-image ordered identification scored 12/12 in ~4 s; a full
 32-image batch processes in ~4 s (~185 tokens per image after
 downsampling — small images cost far less than the 1,024-token cap).
-Text decode speed unchanged (250 tokens in ~8.5-9 s) and the KV pool
-unchanged. One VLM-scale caveat: per-image identification stays strong
+Text decode speed unchanged (250 tokens in ~8 s) and the KV pool
+unchanged. **Budget note (b12x MoE posture):** vision requests emit a
+short run of invisible completion tokens (counted in the token usage,
+empty in the text fields) before the answer — give vision requests
+`max_tokens ≥ ~200` or the budget can be consumed before the answer
+lands. One VLM-scale caveat: per-image identification stays strong
 at the limit, but aggregate counting drifts (a 32-image batch was
 counted as 30).
 
@@ -716,21 +729,23 @@ Where the two differ:
 | `--max-model-len` | `1048576` | `auto` |
 | speculative decode | off | dspark, 7 tokens |
 | `--load-format` | `safetensors` | `b12x` |
-| linear / MoE / attention backend | unset — the engine's own policy | pinned `b12x` ×3 |
+| linear / attention backend | unset — the engine's own policy | pinned `b12x` ×3 (this recipe pins the MoE backend too, `b12x` + the kill switch — see below) |
 
 Two rows are the recipe's whole thesis, and they pull in opposite
 directions from upstream's: upstream asks for **8× less KV cache** and **4×
 fewer concurrent sequences**, with the context derived from that smaller
 pool, which is a speed-shaped lane. This recipe asks for a **large pool and a pinned 1M
-context**, which is a capacity-shaped lane, and accepts roughly 29 tok/s
+context**, which is a capacity-shaped lane, and accepts roughly 31 tok/s
 for that.
 
 Two rows are not a preference but a measured constraint on this hardware.
 The `safetensors` loader instead of `b12x` is wall 3 in the bring-up
 below: the b12x loader's pinned bounce buffers OOM a busy head node.
-And leaving the backends unset is deliberate — the engine's own policy
-is what gate 8 audits, so pinning them would remove the very thing the
-gate exists to check.
+Leaving the dense and attention backends unset is deliberate — the
+engine's own policy is what gate 8 audits. The MoE backend is the one
+exception: this recipe pins it (`b12x`, with the kill switch) because
+the pin's safety condition — the switch — is itself asserted by the
+same gate, so pinning removes nothing the gate exists to check.
 
 ## Upstream delta to watch
 
