@@ -15,10 +15,10 @@ tags:
 **TL;DR** — Serve DeepSeek-V4.1-Flash (552B total, native FP4+FP8 MoE
 with a 196B engram conditional-memory block) tensor-parallel across three
 DGX Sparks on a 200G CX-7 RoCE triangle, using the eugr b12x vLLM fork
-on a public Docker Hub image. Capacity-optimized: a **4 GiB KV
+on a public Docker Hub image. Capacity-optimized: a **5 GiB KV
 reservation** at **1M context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
-block count (roughly 2.4M tokens at 512K, roughly 3.1M at 1M; one full
+block count (roughly 5.1M tokens at 1M with the capacity overlay — one full
 1M request fits with room to spare). **~31 tok/s single-stream** (prose,
 no spec decode), and a short request's first token lands in **under five
 seconds even beside a deep multi-hundred-K prefill** (parallel prefills,
@@ -130,7 +130,7 @@ the defect class this recipe has already been bitten by.
 
 ## Served numbers
 
-Measured at the shipped configuration (gmu 0.85, 4 GiB KV, 1M context,
+Measured at the shipped configuration (gmu 0.85, 5 GiB KV + the capacity overlay, 1M context,
 parallel prefills ×2 + decode-aware policy, kernel autotune off, no spec
 decode, engram on NVMe):
 
@@ -140,10 +140,10 @@ decode, engram on NVMe):
 | TTFT (short prompt, idle) | 1–2 s |
 | TTFT (short prompt beside a deep prefill) | **under 5 s** (was tens of seconds before parallel prefills; the deep prefill itself is unaffected) |
 | Weights per rank | 95.4 GiB |
-| KV reservation | **4 GiB** (fixed by `--kv-cache-memory-bytes`; the engine's token figure scales with the context value) |
+| KV reservation | **5 GiB** (fixed by `--kv-cache-memory-bytes`; with the capacity overlay the pool reads ~5.1M at both contexts) |
 | Context length | **1,048,576 (1M)** — verified by deep-prefill admission to ~900K at the shipped batch width |
-| Concurrency at 1M ctx | **~3×** |
-| Concurrency at 512K ctx | **~4.5×** |
+| Concurrency at 1M ctx | **~4.9×** |
+| Concurrency at 512K ctx | **~9.7×** |
 | Cold boot (load→health) | ~5–6 min (kernel autotune off; ~200 s of that is the weight load) |
 | Temp-0 determinism | identical across runs for most prompts (gate 2). A narrow tie class exists: prompts whose forced answer has an equally-likely variant (a trailing period, a formatting choice) can flip across boots and warm/cold states at temp 0 — measured on three postures, unchanged by context or scheduler knobs. Treat single-word temp-0 outputs as acceptance checks, not correctness proofs. The long-prompt path is a separate gate (9). |
 | Tool calling (deepseek_v41) | working |
@@ -190,7 +190,7 @@ than a slow boot — so this recipe ships neither knob changed.
 
 The community SGLang recipe for this model on the same hardware
 achieves ~51 tok/s but with a 750K KV pool and 262K context. This
-recipe carries roughly four times the pool at 1M context — at ~31
+recipe carries roughly seven times the pool at 1M context — at ~31
 tok/s, with short-request TTFT protected by the parallel-prefill
 policy.
 
@@ -205,9 +205,9 @@ The trade-off table:
 
 | | This recipe (vLLM) | Community SGLang |
 |---|---|---|
-| KV pool | **~3.1M tokens at 1M ctx** (same 4 GiB reservation reads ~2.4M at 512K) | 750K tokens |
+| KV pool | **~5.1M tokens** (5 GiB reservation + the capacity overlay) | 750K tokens |
 | Context | **1M** | 262K (their "256k limit") |
-| Concurrency @ 1M | **~3×** | — |
+| Concurrency @ 1M | **~4.9×** | — |
 | Speed | ~31 tok/s | **51 tok/s** |
 | Short TTFT beside deep prefills | **< 5 s** (parallel prefills) | not published |
 | Spec decode | off (rejected — see below) | on (speed) |
@@ -342,7 +342,7 @@ NCCL_SOCKET_IFNAME="EDIT_ME_MGMT_IF"
 # Memory
 GMU=0.85
 CTX=1048576                        # 1M; pool bytes/blocks unchanged by this knob
-KV_CACHE_MEMORY_BYTES=4g
+KV_CACHE_MEMORY_BYTES=5g
 PAR_PREFILLS=2                     # short-request TTFT beside deep prefills (see FIXLOG);
 PREFILL_POLICY=decode-aware        # requires the count above 1
 B12X_AUTOTUNE=0                    # heuristic cubin plans: ~half boot time, decode parity
@@ -388,7 +388,7 @@ SERVED_MODEL_NAME=main
 Concurrency here means how many full-length requests fit in the KV pool.
 It is a capacity figure, not a promise about simultaneous streams: the
 shipped `--max-num-seqs 8` caps how many requests are served at once, so
-the higher end of the band (the ~4.5x figure at 512K) describes pool depth, not concurrency.
+the higher end of the band (the ~9.7x figure at 512K) describes pool depth, not concurrency.
 
 ### `BLOCK_SIZE=256` — what it is, and what `/metrics` will say
 
@@ -561,12 +561,12 @@ Per-node memory budget at the shipped configuration:
 | Component | Size |
 |---|---|
 | Model weights | 95.4 GiB |
-| KV cache (4 GiB reserved) | 3.7 GiB |
+| KV cache (5 GiB reserved) | 4.7 GiB |
 | NCCL buffers (capped) | 0.14 GiB |
 | CUDA context + framework | ~4 GiB |
 | Compile/CUDA-graph arenas | ~2 GiB |
 | Host OS + daemons | ~8 GiB |
-| **Free (serving, static estimate)** | **~8 GiB — see below** |
+| **Free (serving, static estimate)** | **~7 GiB — see below** |
 
 This table is an arithmetic estimate, not a measurement, and the
 difference matters. Once the weights are resident, the *measured*
@@ -693,7 +693,7 @@ landscape, not to claim a win.
 
 | Recipe | Engine | TP | Image | KV pool | Context |
 |---|---|---|---|---|---|
-| **This one** | vLLM (b12x fork), native weights | **3** | **public Docker Hub, digest-pinned** | **~3.1M tokens at 1M ctx** | **1M** |
+| **This one** | vLLM (b12x fork), native weights | **3** | **public Docker Hub, digest-pinned** | **~5.1M tokens** | **1M** |
 | [MiaAI-Lab](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks) | SGLang | 3 (a 4-node line too) | SGLang base pinned by digest + a local overlay | 750K tokens (TP3) | 256K limit (TP3) |
 | [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f) | vLLM (custom fork) | 3 or 4 | built from the repo; one image serves every shape | 1.3M–5.5M (TP3) – 11.6M (TP4) tokens | 256K (TP3, 4k) / 1M (TP3, TP4) |
 | [tonyd2wild](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-TP2-and-TP4-DGX-Sparks) | TensorFold (a Zig engine); older vLLM lanes | 2 or 4 | engine built from source | 1.05M (TP2) – 29M positions | 300K – 1M |
@@ -722,7 +722,7 @@ Where the two differ:
 
 | knob | this recipe | upstream 3-node |
 |---|---|---|
-| `--kv-cache-memory-bytes` | `4g` | `0.5g` |
+| `--kv-cache-memory-bytes` | `5g` | `0.5g` |
 | `--gpu-memory-utilization` | `0.85` | `0.87` |
 | `--max-num-seqs` | `8` | `2` |
 | `--max-num-batched-tokens` | `8192` | `4096` |
@@ -732,7 +732,7 @@ Where the two differ:
 | linear / attention backend | unset — the engine's own policy | pinned `b12x` ×3 (this recipe pins the MoE backend too, `b12x` + the kill switch — see below) |
 
 Two rows are the recipe's whole thesis, and they pull in opposite
-directions from upstream's: upstream asks for **8× less KV cache** and **4×
+directions from upstream's: upstream asks for **10× less KV cache** and **4×
 fewer concurrent sequences**, with the context derived from that smaller
 pool, which is a speed-shaped lane. This recipe asks for a **large pool and a pinned 1M
 context**, which is a capacity-shaped lane, and accepts roughly 31 tok/s

@@ -21,10 +21,9 @@
 # "disk" is consumed THERE. The "model loading" figure is the non-engram
 # weights; the tables stream at runtime.
 #
-# SERVE LINE: gmu 0.85, kv-cache-memory-bytes 4g (the pool reservation is
-# fixed by that pin; the engine's token figure scales with context at the
-# same block count -- band it, do not quote it), ctx 1048576 (1M: the pool
-# bytes and blocks are UNCHANGED by the context value), parallel prefills
+# SERVE LINE: gmu 0.85, kv-cache-memory-bytes 5g (~21,945 blocks; with
+# the capacity overlay ~5.1M tokens), ctx 1048576 (1M; the reservation
+# pins the pool, not ctx), parallel prefills
 # x2 + decode-aware (a short request's first token beside a deep prefill
 # drops from tens of seconds to under five, at no measurable long-prefill
 # cost), b12x kernel autotune OFF (heuristic plans ship as prebuilt
@@ -100,8 +99,8 @@ GMU="${GMU:-0.85}"                        # the eugr recipe's proven budget
 CTX="${CTX:-1048576}"                     # 1M, measured and kept: pool bytes/blocks unchanged (kv-cache-memory-bytes
                                           # pins them); decode in band; deep-prefill admission proven to ~900K with
                                           # the trough well above the floor. The engine's token figure scales with
-                                          # max_model_len (~2.4M at 512K vs ~3.1M at 1M, same blocks) — quote BLOCKS
-                                          # as the invariant. Do NOT lower without a new boot result.
+                                          # max_model_len; with the capacity overlay the figure is ~5.1M at both.
+                                          # Quote BLOCKS as the invariant. Do NOT lower without a new boot result.
 MNBT="${MNBT:-${MAX_NUM_BATCHED_TOKENS:-8192}}"   # chunked-prefill batch width. 16384 REJECTED (worker OOM during compile at gmu 0.85); 8192 is the proven posture. Retest only with a memory plan
 LIMIT_MM="${LIMIT_MM:-{\"image\": 32}}"               # vision: images per prompt (0 = tower stubbed); each image caps at 1,024 tokens
 # Parallel prefills — measured and kept ("2"): a short request's first token
@@ -120,10 +119,11 @@ LOAD_FORMAT="${LOAD_FORMAT:-safetensors}"
 # single-quoted literal has no escapes and no scanner ambiguity.
 ENGRAM_CONFIG="${ENGRAM_CONFIG:-}"
 if [ -z "$ENGRAM_CONFIG" ]; then
-  # a host-resident table variant measured and rejected: the plane fits and the
-  # mechanism works, but prefill/decode measured IDENTICAL to the streamed path —
-  # engram I/O is not a wall-time factor here, and the resident variant pins
-  # ~2 GiB/rank of host headroom. Retest only with an engram-I/O-bound workload.
+  # a disk-resident scale plane TESTED AND REJECTED: the plane fits and
+  # the mechanism works, but prefill/decode measured IDENTICAL to the streamed
+  # path (5.1K vs 5.2K tok/s prefill, 28.9 vs 29.3 decode) — engram I/O is not
+  # a wall-time factor here, and the plane pins 1.91 GiB/rank of host headroom
+  # serving wants back. Retest only with a workload that is engram-I/O-bound.
   ENGRAM_CONFIG='{"cpu_offload":false,"table_memory":"disk"}'
 fi
 # DSpark speculative decoding — empty default = OFF. REJECTED, FINAL on
@@ -134,7 +134,12 @@ fi
 # stay COMPACT — it crosses an unquoted word-split expansion in the
 # bootstrap, so any space breaks it into garbage args.
 SPEC_CFG="${SPEC_CFG:-}"
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-4g}"
+# 5g, measured and kept (provisional on the trough soak): ~21,945 blocks,
+# ~5.1M tokens / ~4.9x at 1M with the capacity overlay; the 7x512K
+# verification ran at a ~1.7 GB trough (floor 1.6). Drop to 4g if
+# in-service troughs breach the floor (one env; a 24h soak sampler
+# arbitrates).
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-5g}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
@@ -161,14 +166,14 @@ NCCL_BUFFSIZE="${NCCL_BUFFSIZE:-1048576}"
 NCCL_LL128_BUFFSIZE="${NCCL_LL128_BUFFSIZE:-262144}"
 NCCL_PROTO="${NCCL_PROTO:-^LL128}"
 NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
-# b12x autotuner switch — DEFAULT OFF ("0"), measured and kept (a
-# same-session A/B boot): defaults are prebuilt cubins (0 compilations,
-# 0 measured), engine time roughly halved versus the tuned boots, decode
-# at or above the tuned band, determinism/vision/relay PASS. The tuning
-# arena self-budgets at HALF OF FREE MEMORY, and on this unified-memory
-# kernel MemAvailable can read zero — so it never self-limits, and the
-# elastic transient kernel-OOM-killed early boots. Set "=1" to restore
-# per-shape benchmarking only with a specific reason.
+# b12x autotuner switch — DEFAULT OFF ("0"), measured and kept (an
+# A/B boot): defaults are prebuilt cubins (0 compilations, 0 measured),
+# engine time ~6.6 min vs ~12-15 tuned, decode 29.5 tok/s (at/above the
+# tuned 28.8-29.3 band), determinism/vision/relay PASS. The arena
+# self-budgets at HALF OF FREE MEMORY (_race_budget) and the fleet's
+# broken MemAvailable means it never self-limits — it was the elastic
+# transient that kernel-OOM-killed early boots. Set "=1" to
+# restore per-shape benchmarking only with a specific reason.
 # b12x MoE tiny-decode kill switch — CORRECTNESS-CRITICAL, default 0:
 # the tiny-decode path checks num_tokens/k/n/activation but NOT
 # swiglu_limit, so with it enabled ("1") this model's clamped-SwiGLU
@@ -234,6 +239,32 @@ p.write_text(src)
 print("artifacts.py patched (valid_object shim)")
 PY
 fi
+# KV-capacity accounting overlay (the steady/transient split, class of
+# the open upstream PR #52495; measured):
+# stock accounting charges every request its 15 sliding-window groups'
+# peak (window + one whole batch per in-flight step); the overlay charges
+# the window+lookahead per request and the unsettled batches once per
+# pool. Installed BEFORE the boot gate, whose manifest pins the PATCHED
+# hashes — a drifted overlay fails the gate loudly.
+if [ -f /kit/overlay/vllm/v1/core/kv_cache_utils.py ]; then
+  cp /kit/overlay/vllm/v1/core/kv_cache_utils.py \
+     /usr/local/lib/python3.12/dist-packages/vllm/v1/core/kv_cache_utils.py
+  cp /kit/overlay/vllm/v1/kv_cache_interface.py \
+     /usr/local/lib/python3.12/dist-packages/vllm/v1/kv_cache_interface.py
+  # apply-time self-check: the named attributes
+  # must exist in the PINNED image before the window is spent
+  python3 - <<'OV'
+from vllm.v1.kv_cache_interface import SlidingWindowSpec
+from vllm.config.vllm import VllmConfig
+assert hasattr(SlidingWindowSpec, "max_capacity_blocks"), "overlay missing max_capacity_blocks"
+assert hasattr(VllmConfig, "max_in_flight_tokens"), "VllmConfig.max_in_flight_tokens absent"
+assert hasattr(VllmConfig, "num_lookahead_tokens"), "VllmConfig.num_lookahead_tokens absent"
+print("overlay self-check OK (max_capacity_blocks + in-flight/lookahead attrs)")
+OV
+  echo "[ds41-fork] KV-capacity overlay installed"
+else
+  echo "[ds41-fork] KV-capacity overlay ABSENT — boot gate will fail if the manifest expects it" >&2
+fi
 python3 /kit/boot-gate-fork.py /model
 if [[ "${ROLE:-head}" == "worker" ]]; then
   echo "[ds41-fork] worker rank ${NODE_RANK:?} joining ${HEAD_IP:?}:${DIST_MASTER_PORT:-25000}"
@@ -275,7 +306,7 @@ exec vllm serve /model \
   ${HEADLESS_FLAG} \
   --max-model-len "${CTX}" \
   --gpu-memory-utilization "${GMU:-0.85}" \
-  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-4g}" \
+  --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-5g}" \
   --served-model-name "${SERVED_MODEL_NAME:-main}" \
   --limit-mm-per-prompt "${LIMIT_MM}" \
   --port "${PORT:-8600}" \
@@ -285,6 +316,7 @@ exec vllm serve /model \
   ${SPEC_FLAG} \
   ${PREFILL_FLAGS} \
   ${MOE_FLAG} \
+  --no-scheduler-reserve-full-isl \
   --no-enable-flashinfer-autotune \
   --no-enable-log-requests \
   --enable-auto-tool-choice --tool-call-parser "${TOOL_CALL_PARSER:-deepseek_v41}" \
