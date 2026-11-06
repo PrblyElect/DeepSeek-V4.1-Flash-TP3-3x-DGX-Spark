@@ -121,14 +121,12 @@ do_stage_env() {
       || die "failed to stage cluster.env to $box"
     scp -q "$SCRIPT_DIR/start-tp3-fork.sh" "$box:~$REMOTE_DIR/start-tp3-fork.sh" \
       || die "failed to stage start-tp3-fork.sh to $box"
-    # the WHOLE kit travels: the boot gate, the identity manifest, and the
-    # two post-boot gates a reader is told to run on the box. Staging only
-    # the first two left the gates unrunnable on the box they belong to.
-    scp -q "$SCRIPT_DIR/tp3-kit/boot-gate-fork.py" \
-             "$SCRIPT_DIR/tp3-kit/engine-identity.json" \
-             "$SCRIPT_DIR/tp3-kit/verify-resolved-backends.py" \
-             "$SCRIPT_DIR/tp3-kit/check-long-prompt-determinism.py" \
-             "$box:~$REMOTE_DIR/tp3-kit/" \
+    # the WHOLE kit travels: the gates and manifest, the overlay tree the
+    # bootstrap installs on every boot (KV-capacity, and the LM-head overlay
+    # when its knob is set), and the optional sparknet fabric kit (env
+    # templates + node-map template). If you built the transport wheel, it
+    # rides along from tp3-kit/ as-is.
+    scp -q -r "$SCRIPT_DIR/tp3-kit" "$box:~$REMOTE_DIR/" \
       || die "failed to stage tp3-kit to $box"
   done
   say "stage-env: done"

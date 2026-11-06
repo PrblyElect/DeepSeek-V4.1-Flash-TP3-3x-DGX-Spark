@@ -104,7 +104,15 @@ FORBIDDEN_MARKERS = {
 ALLREDUCE_RE = re.compile(
     r"Using \[([^\]]*)\] all-reduce backends(?: \(in dispatch order\))?"
     r"(?: for group '([^']*)')?")
-ALLREDUCE_KEYS = ("allreduce_backend",)
+ALLREDUCE_KEYS = ("allreduce_backend", "allreduce_backend_by_group")
+
+
+def expected_ar(expect: dict, group: str | None):
+    """Expected all-reduce backend for one dispatch group (map first, scalar fallback)."""
+    m = expect.get("allreduce_backend_by_group") or {}
+    if group is not None and group in m:
+        return m[group]
+    return expect.get("allreduce_backend")
 
 
 def norm_backends(raw):
@@ -369,8 +377,9 @@ def main():
     # would let a lane that engaged the collective on one group and fell
     # back on the other pass, so every line must agree.
     want_ar = expect.get("allreduce_backend")
-    if want_ar is not None:
-        want_norm = norm_backends(want_ar)
+    want_map = expect.get("allreduce_backend_by_group") or {}
+    if want_ar is not None or want_map:
+        want_norm = norm_backends(want_ar) if want_ar is not None else None
         # (backends, group) per dispatch line. The group is what makes a
         # mixed-lane failure actionable: 'tp:0' and 'ep:0' are independent
         # collectives, so "tp:0 engaged X" says which one moved.
@@ -380,13 +389,21 @@ def main():
             check(False, f"log: allreduce_backend == {want_ar!r} — the dispatch "
                          f"line was not found in the engine log")
         else:
-            wrong = [(g, grp) for g, grp in engaged if g != want_norm]
-            check(not wrong, f"log: allreduce_backend == {want_ar!r}"
+            wrong = []
+            for g, grp in engaged:
+                want = expected_ar(expect, grp) if want_map else want_ar
+                if want is None:
+                    continue
+                if g != norm_backends(want):
+                    wrong.append((g, grp, want))
+            want_desc = (repr(want_map) if want_map else repr(want_ar))
+            check(not wrong, f"log: allreduce_backend == {want_desc}"
                   + ("" if not wrong
                      else " — the engine engaged "
                           + ", ".join(
-                              (f"group {grp!r}: " if grp else "") + repr(", ".join(g))
-                              for g, grp in wrong)))
+                              (f"group {grp!r}: " if grp else "")
+                              + repr(", ".join(g)) + f" (expected {want!r})"
+                              for g, grp, want in wrong)))
             if wrong:
                 diag = re.search(r"RoCEnante initialization failed:[^\n]*", logs)
                 if diag:
