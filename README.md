@@ -19,8 +19,10 @@ on a public Docker Hub image. Capacity-optimized: a **5 GiB KV
 reservation** at **1M context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
 block count (roughly 5.1M tokens at 1M with the capacity overlay — one full
-1M request fits with room to spare). **~31 tok/s single-stream** (prose,
-no spec decode), and a short request's first token lands in **under five
+1M request fits with room to spare). **~35 tok/s single-stream** (prose,
+no spec decode — the LM-head kernel, L2 set-aside and loader below are all
+part of the shipped posture), a cold boot loads the weights in **~32 s**
+(b12x O_DIRECT loader), and a short request's first token lands in **under five
 seconds even beside a deep multi-hundred-K prefill** (parallel prefills,
 measured — see FIXLOG). Engram n-gram tables are served from NVMe,
 freeing 31 GiB/rank of host memory that would otherwise be consumed.
@@ -73,7 +75,7 @@ boxes, and:
 ```sh
 ./launch/ds41-flash-tp3-up preflight    # image digest + content, checkpoint, fabric
 ./launch/ds41-flash-tp3-up stage-env     # copies cluster.env + launcher + tp3-kit
-./launch/ds41-flash-tp3-up start --yes   # head first, then the workers; :8600 in ~5–6 min
+./launch/ds41-flash-tp3-up start --yes   # head first, then the workers; :8600 in a few minutes
 ```
 
 `preflight` is read-only: it inspects the image that is already on the
@@ -136,7 +138,7 @@ decode, engram on NVMe):
 
 | Metric | Value |
 |---|---|
-| Single-stream decode (prose) | ~31 tok/s (b12x MoE) |
+| Single-stream decode (prose) | ~35 tok/s (b12x MoE + LM-head kernel + L2 set-aside; ~31 without the 2026-11 kernel stack) |
 | TTFT (short prompt, idle) | 1–2 s |
 | TTFT (short prompt beside a deep prefill) | **under 5 s** (was tens of seconds before parallel prefills; the deep prefill itself is unaffected) |
 | Weights per rank | 95.4 GiB |
@@ -144,7 +146,7 @@ decode, engram on NVMe):
 | Context length | **1,048,576 (1M)** — verified by deep-prefill admission to ~900K at the shipped batch width |
 | Concurrency at 1M ctx | **~4.9×** |
 | Concurrency at 512K ctx | **~9.7×** |
-| Cold boot (load→health) | ~5–6 min (kernel autotune off; ~200 s of that is the weight load) |
+| Cold boot (load→health) | a few minutes (weight load ~32 s with the b12x loader, ~190 s on the safetensors fallback; the first boot pays kernel compilation, later boots save ~60 s via the persistent cache) |
 | Temp-0 determinism | identical across runs for most prompts (gate 2). A narrow tie class exists: prompts whose forced answer has an equally-likely variant (a trailing period, a formatting choice) can flip across boots and warm/cold states at temp 0 — measured on three postures, unchanged by context or scheduler knobs. Treat single-word temp-0 outputs as acceptance checks, not correctness proofs. The long-prompt path is a separate gate (9). |
 | Tool calling (deepseek_v41) | working |
 | Reasoning parser (deepseek_v41) | working |
@@ -153,7 +155,7 @@ decode, engram on NVMe):
 
 ### Where the boot time goes
 
-The cold boot above is ~5–6 minutes, and the weight load is ~200 s of
+The cold boot above is a few minutes end to end; the weight load is ~32 s of
 it. The shipped configuration runs the b12x kernel autotune **off**
 (`B12X_AUTOTUNE=0`): the tuned alternative benchmarks kernel plans for
 every shape this model and batch width produce, and its tuning arena
@@ -186,11 +188,45 @@ Persistence would have to come from a mount keyed by the image build
 stamp — a stale artifact is a *wrong kernel*, which is a worse failure
 than a slow boot — so this recipe ships neither knob changed.
 
+## The decode-step stack (all measured keeps, all one-line undo)
+
+The ~35 tok/s figure is not one knob; it is the b12x MoE backend plus four
+additions landed and A/B-measured one variable at a time (see FIXLOG for the
+failure modes that did not survive):
+
+1. **The LM-head kernel** — the engine hard-codes the `cutlass` MXFP8 GEMV
+   for linear heads; the image already ships a b12x warp-MMA kernel ~2.1×
+   faster at the decode shape with bit-identical output
+   (`VLLM_MXFP8_LINEAR_BACKEND=auto`, +~6%).
+2. **L2 behaviour** — the indexer's prefetcher stays ON (disabling it was
+   measured at ~−5%), and a 12 MB persisting-L2 set-aside lands another
+   ~1–2% (`VLLM_GLM53_L2_PREFETCH_PERSIST_MB=12`).
+3. **The b12x loader** — not a decode win but a boot win: ~32 s loads.
+4. **The persistent compile cache** — ~60 s off every cold start after the
+   first.
+
+Each of these is a launcher line or a kit overlay; removing the line
+restores the prior behaviour. The 0491 capacity overlay and the parallel
+prefill policy below are the same pattern.
+
+## The one-shot RoCE transport (optional layer)
+
+The stock lane carries its TP all-reduce on NCCL over the triangle. The
+image's own one-shot RoCE collective cannot form on a one-cable-per-pair
+fabric (it demands two rails per peer pair — the bring-up gate was built on
+exactly that silent fallback). `tp3-kit/sparknet/` ships an optional layer
+that switches the small collectives to a per-peer-HCA-map one-shot transport
+measured at **~+5% single-stream and +12–15% two-stream aggregate** on this
+posture, with no memory cost: routing templates you edit for your fabric, a
+node-map template, the fenced-NCCL build recipe, and the GID-index trap that
+the first boot found the hard way. Off by default; the launcher refuses a
+half-armed boot. See `launch/tp3-kit/sparknet/README.md`.
+
 ## Why capacity over speed
 
 The community SGLang recipe for this model on the same hardware
 achieves ~51 tok/s but with a 750K KV pool and 262K context. This
-recipe carries roughly seven times the pool at 1M context — at ~31
+recipe carries roughly seven times the pool at 1M context — at ~35
 tok/s, with short-request TTFT protected by the parallel-prefill
 policy.
 
@@ -198,7 +234,7 @@ For workloads that are context-bound (RAG with large knowledge bases,
 long legal or research documents, multi-turn conversations with massive
 history), the KV pool and context length are the binding constraints,
 not generation speed. A 300K-token document is rejected outright at a
-262K context; a ~20 tok/s difference in generation speed is invisible when
+262K context; a ~16 tok/s difference in generation speed is invisible when
 streaming at reading speed.
 
 The trade-off table:
@@ -208,7 +244,7 @@ The trade-off table:
 | KV pool | **~5.1M tokens** (5 GiB reservation + the capacity overlay) | 750K tokens |
 | Context | **1M** | 262K (their "256k limit") |
 | Concurrency @ 1M | **~4.9×** | — |
-| Speed | ~31 tok/s | **51 tok/s** |
+| Speed | ~35 tok/s | **51 tok/s** |
 | Short TTFT beside deep prefills | **< 5 s** (parallel prefills) | not published |
 | Spec decode | off (rejected — see below) | on (speed) |
 | Engine | vLLM (eugr b12x) | SGLang (custom) |
@@ -253,18 +289,21 @@ setting that makes V4.1 bootable at TP3 on this hardware.
 
 ### 3. The b12x loader's bounce buffers OOM on busy head nodes
 
-The b12x O_DIRECT loader uses pinned bounce buffers that add ~10–16 GiB
-of unreclaimable host memory during weight loading. On a head node that
-also runs the API server and the usual system daemons, this tips the box
-into kernel OOM during load. Fix:
+**Updated (measured, 2026-11): the b12x loader is now the shipped default —
+with the capacity overlay and the 5 GiB posture it loads the same checkpoint
+in ~32 s versus ~190 s for safetensors mmap, pool and decode unchanged, and
+the historical OOM no longer reproduces.** The original wall, kept for
+context: the b12x O_DIRECT loader uses pinned bounce buffers that add
+~10–16 GiB of unreclaimable host memory during weight loading, which on a
+busy head node tipped boxes into kernel OOM. If you hit that class of
+failure on a smaller-memory configuration, the conservative fallback is:
 
 ```sh
 --load-format safetensors    # instead of b12x
 ```
 
 Plain safetensors streams through kernel-evictable page cache instead
-of pinned bounce buffers. The image's value is in its serving kernels
-and memory management, not its loader — the loader is swappable.
+of pinned bounce buffers — slower (~6×), but unconditionally safe.
 
 ### 4. The startup free-memory check
 
@@ -362,8 +401,8 @@ LIMIT_MM='{"image": 32}'             # images per prompt: the checkpoint's 32-la
                                   # ViT tower is served above 0 (verified live);
                                   # at 0 the engine stubs the tower (text-only)
 
-# Loader
-LOAD_FORMAT=safetensors
+# Loader (b12x: ~32 s load vs ~190 s; safetensors is the conservative fallback)
+LOAD_FORMAT=b12x
 ENGRAM_CONFIG='{"cpu_offload":false,"table_memory":"disk"}'
 
 # NCCL (the critical caps)
@@ -438,7 +477,7 @@ pass. On this configuration the engine resolves:
 | attention | b12x (DSA indexer) |
 | TP=3 head padding | 64 heads → 72, in 9 output groups |
 | speculative decode | off |
-| load format | `safetensors` |
+| load format | `b12x` |
 | all-reduce transport | `PYNCCL` (see **The one-shot RoCE all-reduce is not engaged on this fabric**) |
 
 Two of those are load-bearing and are checked, not assumed:
@@ -728,19 +767,20 @@ Where the two differ:
 | `--max-num-batched-tokens` | `8192` | `4096` |
 | `--max-model-len` | `1048576` | `auto` |
 | speculative decode | off | dspark, 7 tokens |
-| `--load-format` | `safetensors` | `b12x` |
+| `--load-format` | `b12x` (measured keep: ~32 s load; was `safetensors`) | `b12x` |
 | linear / attention backend | unset — the engine's own policy | pinned `b12x` ×3 (this recipe pins the MoE backend too, `b12x` + the kill switch — see below) |
 
 Two rows are the recipe's whole thesis, and they pull in opposite
 directions from upstream's: upstream asks for **10× less KV cache** and **4×
 fewer concurrent sequences**, with the context derived from that smaller
 pool, which is a speed-shaped lane. This recipe asks for a **large pool and a pinned 1M
-context**, which is a capacity-shaped lane, and accepts roughly 31 tok/s
+context**, which is a capacity-shaped lane, and accepts roughly 35 tok/s
 for that.
 
 Two rows are not a preference but a measured constraint on this hardware.
-The `safetensors` loader instead of `b12x` is wall 3 in the bring-up
-below: the b12x loader's pinned bounce buffers OOM a busy head node.
+The loader row is wall 3 in the bring-up below; the 2026-11 re-measure
+flipped it (the OOM was a pre-overlay posture, and the load-time win is
+~6×) — `b12x` ships, `safetensors` stays documented as the fallback.
 Leaving the dense and attention backends unset is deliberate — the
 engine's own policy is what gate 8 audits. The MoE backend is the one
 exception: this recipe pins it (`b12x`, with the kill switch) because
@@ -761,7 +801,7 @@ two cannot be read as a delta.
 | [#64441](https://github.com/vllm-project/vllm/pull/64441) [1/N] top-k order | **open** | no | batch invariance for DeepSeek V4 — the upstream defect, see the note below |
 | [#64870](https://github.com/vllm-project/vllm/pull/64870) [2/N] compressor | **open** | no | the same series |
 | [#64884](https://github.com/vllm-project/vllm/pull/64884) [3/N] mHC | **open** | no | the same series |
-| [#58720](https://github.com/vllm-project/vllm/pull/58720) indexed expert-mapping lookups | v0.32.0 | yes | −25 s weight load on DGX Spark; the load here takes ~200 s |
+| [#58720](https://github.com/vllm-project/vllm/pull/58720) indexed expert-mapping lookups | v0.32.0 | yes | −25 s weight load on DGX Spark; the load here takes ~32 s (b12x loader) |
 | [#54048](https://github.com/vllm-project/vllm/pull/54048) cuBLAS out_dtype router GEMM | v0.32.0 | yes | a GB10-specific GEMM path |
 | [#58925](https://github.com/vllm-project/vllm/pull/58925) encoder CUDA-graph packing for V4.1 | v0.32.0 | yes | mean TTFT on vision workloads |
 | [#58132](https://github.com/vllm-project/vllm/pull/58132) / [#59532](https://github.com/vllm-project/vllm/pull/59532) SWA bounded replay | v0.32.0 | yes | the SWA geometry the block-size story above depends on |

@@ -87,7 +87,8 @@ time curl -s http://HEAD_IP:8600/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"main","messages":[{"role":"user","content":"Write a detailed paragraph about ocean currents."}],"max_tokens":250,"temperature":0}' | \
   jq '.usage.completion_tokens'
-# expected: 250 tokens in ~8 s (~31 tok/s)
+# expected: 250 tokens in ~7 s (~35 tok/s with the shipped kernel stack;
+#           ~31 tok/s without the LM-head backend + L2 set-aside)
 ```
 
 ## 6. KV pool (from boot log)
@@ -154,7 +155,10 @@ one-shot RoCE collective (`B12X_ROCENANTE`) that needs both RoCE rails of
 a link to reach the peer. The topology this recipe ships has one cable
 per **pair of boxes** — three cables, each device connected to the other
 two, and both of each device's ports in use — so that collective cannot
-form: the engine logs the failure and engages `PYNCCL` instead. The gate
+form: the engine logs the failure and engages `PYNCCL` instead. With the
+optional sparknet layer armed, the expectation is per-group instead
+(`tp:0` = `SPARKNET_ONESHOT,PYNCCL`, `ep:0` = `PYNCCL` — see
+`tp3-kit/sparknet/README.md`). The gate
 asserts the transport that **actually engaged**, on every group the
 engine reports, against `resolved_backends.expect.allreduce_backend` in
 the manifest.

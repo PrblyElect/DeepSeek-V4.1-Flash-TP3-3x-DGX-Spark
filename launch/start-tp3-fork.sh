@@ -111,7 +111,16 @@ LIMIT_MM="${LIMIT_MM:-{\"image\": 32}}"               # vision: images per promp
 # (engine-side validation) and is only passed when the count is above 1.
 PAR_PREFILLS="${PAR_PREFILLS:-2}"
 PREFILL_POLICY="${PREFILL_POLICY:-decode-aware}"
-LOAD_FORMAT="${LOAD_FORMAT:-safetensors}"
+# Decode-under-prefill share — KEEP (measured 2026-11): 0.5 static + 2048/step cap;
+# see the bootstrap comment for the measured why. Empty ("") = legacy behavior.
+PREFILL_COMPUTE_SHARE="${PREFILL_COMPUTE_SHARE:-0.5}"
+PREFILL_TOKENS_PER_STEP="${PREFILL_TOKENS_PER_STEP:-2048}"
+# Row 13 (KEEP, 2026-11): the b12x loader routes checkpoint views through an
+# asynchronous read ring (O_DIRECT bounce buffers on GB10 - read_mode=auto
+# resolves to "bounce" because capabilities(0).host_page_tables == 1), and cut
+# the model-load phase ~190 s -> ~32 s. Override with LOAD_FORMAT=safetensors
+# to fall back to the default path.
+LOAD_FORMAT="${LOAD_FORMAT:-b12x}"
 # The engram default is assigned in TWO steps, never inline in ${VAR:-...}.
 # A brace inside a parameter-expansion default makes bash terminate the
 # expansion early once the variable IS set, which silently appended a stray
@@ -170,7 +179,7 @@ NCCL_MAX_NCHANNELS="${NCCL_MAX_NCHANNELS:-8}"
 # A/B boot): defaults are prebuilt cubins (0 compilations, 0 measured),
 # engine time ~6.6 min vs ~12-15 tuned, decode 29.5 tok/s (at/above the
 # tuned 28.8-29.3 band), determinism/vision/relay PASS. The arena
-# self-budgets at HALF OF FREE MEMORY (_race_budget) and the fleet's
+# self-budgets at HALF OF FREE MEMORY (_race_budget) and on these boxes the
 # broken MemAvailable means it never self-limits — it was the elastic
 # transient that kernel-OOM-killed early boots. Set "=1" to
 # restore per-shape benchmarking only with a specific reason.
@@ -265,7 +274,99 @@ OV
 else
   echo "[ds41-fork] KV-capacity overlay ABSENT — boot gate will fail if the manifest expects it" >&2
 fi
+# sparknet one-shot communicator overlay (the transport layer): installed ONLY when the fabric
+# is rendered. The stock file is unchanged for every other boot; the adapter
+# import is inside the RoCE branch, so a non-sparknet boot never imports it.
+if [ "${VLLM_ENABLE_ROCE_ALLREDUCE:-0}" = "1" ] && [ -n "${SPARKNET_ROCE_TOPOLOGY:-}" ]; then
+  # the engine-side policy guard is absent, so the knob would silently kill
+  # the transport. Refuse it here instead of booting a dead one-shot path.
+  case " ${EXTRA_SERVE_ARGS:-} " in
+    *" --disable-custom-all-reduce "*)
+      echo "[ds41-fork] REFUSING: --disable-custom-all-reduce disables the sparknet one-shot transport (policy guard)" >&2
+      exit 2 ;;
+  esac
+  if [ -f /kit/overlay/vllm/distributed/device_communicators/cuda_communicator.py ]; then
+    cp /kit/overlay/vllm/distributed/device_communicators/cuda_communicator.py \
+       /usr/local/lib/python3.12/dist-packages/vllm/distributed/device_communicators/cuda_communicator.py
+    echo "[ds41-fork] sparknet communicator overlay installed"
+  else
+    echo "[ds41-fork] RoCE transport requested but the communicator overlay is ABSENT" >&2
+    exit 1
+  fi
+  if [ -f /kit/overlay/vllm/v1/worker/gpu_worker.py ]; then
+    cp /kit/overlay/vllm/v1/worker/gpu_worker.py \
+       /usr/local/lib/python3.12/dist-packages/vllm/v1/worker/gpu_worker.py
+    echo "[ds41-fork] sparknet gpu_worker freeze overlay installed"
+  else
+    echo "[ds41-fork] sparknet requested but the gpu_worker overlay is ABSENT" >&2
+    exit 1
+  fi
+  # The sparknet runtime (pure-python, --no-deps) and this rank's rendered
+  # routing envs (per-peer HCA map + subnets from the node map). The proxy
+  # .so and kernels come from the pre-warmed cache mount; the transport kit README
+  # builds them so a boot never compiles.
+  # the cache/fence mounts key on the HOST env, this gate on the forwarded
+  # topology — a topology set without the host env would install the overlay
+  # but boot without the warmed cache and the NCCL fence. Close that hole:
+  if [ -z "${SPARKNET_ROCE_CACHE_DIR:-}" ]; then
+    echo "[ds41-fork] REFUSING: sparknet gate fired but no cache mount (host VLLM_ENABLE_ROCE_ALLREDUCE unset?) " >&2
+    exit 1
+  fi
+  set -a
+  # shellcheck disable=SC1091
+  . "/kit/sparknet/env-rank${NODE_RANK:-0}.sh"
+  set +a
+  python3 -m pip install --no-deps --no-index --quiet /kit/dgx_spark_networking-0.5.0-py3-none-any.whl \
+    || { echo "[ds41-fork] sparknet wheel install FAILED" >&2; exit 1; }
+  echo "[ds41-fork] sparknet wheel installed; rank ${NODE_RANK:-0} routing: topology=${SPARKNET_ROCE_TOPOLOGY:-unset} peers=${SPARKNET_ROCE_PEER_HCAS:-unset}"
+  # NCCL fence gate: when the fenced .so is bind-mounted, the sha proves the
+  # bytes and ncclGetVersion proves the ABI (23203 at version parity).
+  if [ -n "${NCCL_FENCE_SHA:-}" ]; then
+    GOT_SHA=$(sha256sum /usr/lib/aarch64-linux-gnu/libnccl.so.2.32.3 | cut -d" " -f1)
+    if [ "$GOT_SHA" != "$NCCL_FENCE_SHA" ]; then
+      echo "[ds41-fork] NCCL fence sha MISMATCH: $GOT_SHA != $NCCL_FENCE_SHA" >&2
+      exit 1
+    fi
+    python3 - <<'PYNCCLGATE'
+import ctypes
+lib = ctypes.CDLL("libnccl.so.2")
+v = ctypes.c_int(0)
+rc = lib.ncclGetVersion(ctypes.byref(v))
+assert rc == 0, rc
+assert v.value == 23203, v.value
+print("[ds41-fork] NCCL fence verified: sha match, ncclGetVersion 23203")
+PYNCCLGATE
+  fi
+fi
 python3 /kit/boot-gate-fork.py /model
+# the LM-head kernel (2026-11): the LM head's MXFP8 GEMM backend. The generic FlashInfer
+# MXFP8 linear path hard-codes backend="cutlass", and that CUTLASS kernel runs
+# the LM head's M=1 GEMV at ~41% of the HBM roofline (~2.1 ms
+# of MXFP8 weights). flashinfer's own b12x "warp-level MMA kernel with
+# small-M decode tiles" runs the identical math at ~87% (~0.96 ms) and was
+# BIT-IDENTICAL in the in-container bench (max abs diff 0). The overlay is
+# installed ONLY when the knob is set, and only AFTER the boot gate has pinned
+# the audited stock file -- so the standing posture is the untouched image and
+# a new image cannot be silently downgraded by this file. Undo: leave the
+# knob unset.
+if [ -n "${VLLM_MXFP8_LINEAR_BACKEND:-}" ]; then
+  LMH_OV=/kit/overlay/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py
+  LMH_DST=/usr/local/lib/python3.12/dist-packages/vllm/model_executor/kernels/linear/mxfp8/flashinfer.py
+  if [ ! -f "$LMH_OV" ]; then
+    echo "[ds41-fork] VLLM_MXFP8_LINEAR_BACKEND is set but the LM-head overlay is ABSENT" >&2
+    exit 1
+  fi
+  cp "$LMH_OV" "$LMH_DST"
+  python3 - "$LMH_DST" <<'PYLMH'
+import sys
+src = open(sys.argv[1]).read()
+assert 'os.environ.get("VLLM_MXFP8_LINEAR_BACKEND", "cutlass")' in src, \
+    "overlay missing the backend knob"
+assert 'backend="cutlass"' not in src, "overlay still hard-codes cutlass"
+print("[ds41-fork] LM-head overlay self-check OK (backend knob present)")
+PYLMH
+  echo "[ds41-fork] LM-head MXFP8 backend overlay installed (backend=${VLLM_MXFP8_LINEAR_BACKEND})"
+fi
 if [[ "${ROLE:-head}" == "worker" ]]; then
   echo "[ds41-fork] worker rank ${NODE_RANK:?} joining ${HEAD_IP:?}:${DIST_MASTER_PORT:-25000}"
   HEADLESS_FLAG="--headless"
@@ -290,12 +391,25 @@ PREFILL_FLAGS=""
 if [ "${PAR_PREFILLS:-1}" != "1" ]; then
   PREFILL_FLAGS="--max-parallel-prefills ${PAR_PREFILLS} --prefill-policy ${PREFILL_POLICY}"
 fi
+# Decode-under-prefill share (KEPT 2026-11, three-boot ladder): a
+# short request decoding beside a deep prefill crawls at 1.4 tok/s on the
+# default posture (the scheduler alternates PURE steps, so a mixed-step cap
+# is a no-op — a measured boot refuted --max-num-scheduled-tokens). A STATIC
+# prefill-compute-share 0.5 + a 2048/step contended-prefill cap lifts that
+# decode to 8.2-9.6 tok/s (~6.5x) at ZERO idle cost (solo 26.1-28.9 tok/s,
+# TTFT 0.46-0.73s vs the 29.2/0.5s baseline) and a +2-11% deep-prefill
+# wall. "auto" is explicitly NOT the keep: it charged ~15% idle decode and
+# 1.6-4.3s TTFT (boot the pre-change record). Set PREFILL_COMPUTE_SHARE="" to restore the
+# legacy behavior.
+if [ -n "${PREFILL_COMPUTE_SHARE:-}" ]; then
+  PREFILL_FLAGS="${PREFILL_FLAGS} --prefill-compute-share ${PREFILL_COMPUTE_SHARE} --max-num-prefill-tokens-per-step ${PREFILL_TOKENS_PER_STEP:-2048}"
+fi
 MOE_FLAG=""
 if [ -n "${MOE_BACKEND:-}" ]; then
   MOE_FLAG="--moe-backend ${MOE_BACKEND}"
 fi
 exec vllm serve /model \
-  --load-format "${LOAD_FORMAT:-safetensors}" \
+  --load-format "${LOAD_FORMAT:-b12x}" \
   --engram-config "${ENGRAM_CONFIG}" \
   --tensor-parallel-size "${TP:-3}" \
   --distributed-executor-backend mp \
@@ -440,6 +554,49 @@ fi
 # defect class this recipe has already been bitten by (knobs read but never
 # forwarded). A reader can check that every value in the profile reached the
 # container by reading the printed command, and that command IS the command.
+# sparknet (the transport layer): the RDMA proxy .so and the TileLang one-shot kernels are
+# compiled ONCE into a host-side cache dir and bind-mounted read-write — a
+# cold compile inside a boot would stall the transport at startup (the
+# cold-compile lesson), and a container-local cache would recompile on every boot.
+SPARKNET_CACHE_ARGS=""
+if [ "${VLLM_ENABLE_ROCE_ALLREDUCE:-0}" = "1" ] && [ -n "${SPARKNET_ROCE_TOPOLOGY:-}" ]; then
+  SN_CACHE="$HOME/ds41-flash-tp3/sparknet-cache"
+  mkdir -p "$SN_CACHE/roce" "$SN_CACHE/tilelang"
+  SPARKNET_CACHE_ARGS="-v $SN_CACHE:/sparknet-cache -e SPARKNET_ROCE_CACHE_DIR=/sparknet-cache/roce -e TILELANG_CACHE_DIR=/sparknet-cache/tilelang"
+  echo "[ds41-fork] sparknet cache mount: $SN_CACHE"
+  # The fenced NCCL (2.32.3 + 0001) rides in on the same cache mount when
+  # staged: a read-only bind over the one real file BOTH resolution routes
+  # load (the soname symlink resolves here). Rollback =
+  # restart without the file. The sha gate in the bootstrap proves the
+  # mounted bytes are the built fence, not the stock image .so.
+  if [ -f "$SN_CACHE/nccl/libnccl.so.2.32.3" ] && [ -f "$SN_CACHE/nccl/libnccl.so.2.32.3.sha256" ]; then
+    FENCE_SHA=$(cut -d" " -f1 "$SN_CACHE/nccl/libnccl.so.2.32.3.sha256")
+    SPARKNET_CACHE_ARGS="$SPARKNET_CACHE_ARGS -v $SN_CACHE/nccl/libnccl.so.2.32.3:/usr/lib/aarch64-linux-gnu/libnccl.so.2.32.3:ro -e NCCL_FENCE_SHA=$FENCE_SHA"
+    echo "[ds41-fork] NCCL fence mount armed (sha ${FENCE_SHA:0:16})"
+  fi
+fi
+# persistent b12x compile cache: /root/.cache/b12x lives in the
+# container's writable layer, so every recreate throws the compiled MoE
+# kernels away and each boot pays the compile again inside the model-load /
+# init-engine phase (the cold arm of the measured cold/warm pair). This is
+# the same pattern as the sparknet cache above: one host directory, one
+# bind mount, one env knob to turn it off.
+#
+# STALE-CACHE SAFETY (the measured note): b12x keys its compile
+# entries by CONTENT HASH -- sha256-named .o/.json pairs under compile/ -- so
+# a different engine or image yields cache MISSES, never a wrong kernel. The
+# host directory is additionally keyed by the image repo digest, so each
+# image keeps its own cache and eviction is obvious rather than silent.
+# The cache is advisory: a corrupt entry is a compile error, not a bad
+# kernel, and removing the directory is always safe.
+B12X_CACHE_ARGS=""
+if [ "${B12X_PERSISTENT_CACHE:-1}" = "1" ]; then
+  B12X_CACHE_KEY="$(printf '%s' "${EXPECT_IMAGE_REPO_DIGEST:-unknown}" | sed 's/^sha256://; s/[^0-9a-f]//g' | cut -c1-12)"
+  B12X_CACHE="$HOME/ds41-flash-tp3/b12x-cache/$B12X_CACHE_KEY"
+  mkdir -p "$B12X_CACHE"
+  B12X_CACHE_ARGS="-v $B12X_CACHE:/root/.cache/b12x"
+  echo "[ds41-fork] b12x cache mount: $B12X_CACHE"
+fi
 run_args=(
   --name "$CONTAINER_NAME"
   ${SECURITY_OPTS}
@@ -480,6 +637,9 @@ run_args=(
   -e NCCL_NET_GDR_LEVEL=LOC -e NCCL_NET_PLUGIN=none
   -e VLLM_ENABLE_ROCE_ALLREDUCE=1
   -e VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB
+  -e SPARKNET_ROCE_TOPOLOGY="${SPARKNET_ROCE_TOPOLOGY:-}"
+  ${SPARKNET_CACHE_ARGS}
+  ${B12X_CACHE_ARGS}
   -e B12X_COMPILE_WORKERS=4
   -e CUTE_DSL_ARCH=sm_121a
   -e VLLM_USE_V2_MODEL_RUNNER=1
@@ -488,13 +648,53 @@ run_args=(
   -e VLLM_ENABLE_PCIE_ALLREDUCE=0
   -e B12X_AUTOTUNE="$B12X_AUTOTUNE"
   -e B12X_W4A8_TINY_DECODE="$B12X_W4A8_TINY_DECODE"
+  -e VLLM_DS41_L2_PREFETCH="${VLLM_DS41_L2_PREFETCH:-1}"
+  # the budget sweep (2026-11): the per-window L2-prefetch fill budgets. GB10's L2 is
+  # 24 MB and one layer's live working set is the WO + FFN + NEXT windows
+  # together, so the shipped defaults (20+16+20 = 56 MB) stage 2.3x what the
+  # cache can hold. These knobs are the recipe's way to size that working set;
+  # the defaults below are the values in force before this window, so the
+  # plumbing alone changes nothing.
+  -e VLLM_DS41_L2_PREFETCH_WO_MB="${VLLM_DS41_L2_PREFETCH_WO_MB:-20}"
+  -e VLLM_DS41_L2_PREFETCH_FFN_MB="${VLLM_DS41_L2_PREFETCH_FFN_MB:-16}"
+  -e VLLM_DS41_L2_PREFETCH_NEXT_MB="${VLLM_DS41_L2_PREFETCH_NEXT_MB:-20}"
+  # the L2 set-aside (2026-11): the prefetcher issues its bulk-L2 fills with an
+  # `evict_last` policy, which only protects lines inside the CUDA
+  # persisting-L2 set-aside. That set-aside is 0 by default, so the
+  # protection the prefetcher asks for is inert. GB10's L2 is 24 MB and the
+  # device allows an 18 MB set-aside; this knob sizes it. The default below
+  # is 0 = the driver limit untouched = the behaviour in force before this
+  # window, so the plumbing alone changes nothing. NOTE the env name is the
+  # GLM module's: the DS41 prefetcher reuses the GLM one.
+  -e VLLM_GLM53_L2_PREFETCH_PERSIST_MB="${VLLM_GLM53_L2_PREFETCH_PERSIST_MB:-12}"
+  # the grid sweep (2026-11): the issuing-CTA count of the bulk-L2 fill. The GLM
+  # module's default is 4 on GB10 (SM121) -- a value its own docstring records
+  # as "measured best" at TP4 with an EIGHT-ROW verifier. We are TP3 with one
+  # live token per step, so the knob is shape-sensitive and has never been set
+  # here. The default below is the value in force before this window, so the
+  # plumbing alone changes nothing. Read at import time by the module.
+  -e VLLM_L2_PREFETCH_GRID="${VLLM_L2_PREFETCH_GRID:-4}"
+  # the LM-head kernel (2026-11): the backend the generic FlashInfer MXFP8 linear kernel
+  # asks for. The stock hard-coded "cutlass" ran the LM head's M=1 GEMV at
+  # ~41% of the HBM roofline; flashinfer's own b12x
+  # "small-M decode tiles" kernel runs the identical math at ~87%
+  # and is BIT-IDENTICAL (bit-identical output across a bench sweep). LANDED:
+  # worth ~+6% single-stream, determinism gate
+  # PASS. The default below is "auto"; set it to "cutlass" to restore the
+  # stock kernel. The knob also gates the kit overlay that makes the argument
+  # selectable at all.
+  -e VLLM_MXFP8_LINEAR_BACKEND="${VLLM_MXFP8_LINEAR_BACKEND:-auto}"
   -e VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS="$VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS"
   -e MOE_BACKEND="$MOE_BACKEND"
+  # AV's profile context len is the drafter-decision lever; the fixed -e list previously
+  # dropped it, so a pre-flight that set it would silently run the 8192 default.
+  -e VLLM_ADAPTIVE_VERIFICATION_PROFILE_CONTEXT_LEN="${AV_PROFILE_CTX:-8192}"
   -e PYTHONPYCACHEPREFIX=/tmp/pycache
   -e RUNAI_STREAMER_MEMORY_LIMIT=4294967296
   -e PYTORCH_CUDA_ALLOC_CONF="$PYTORCH_CUDA_ALLOC_CONF"
   -e PORT="$PORT" -e TP="$TP" -e GMU="$GMU" -e CTX="$CTX" -e MNBT="$MNBT" -e LIMIT_MM="$LIMIT_MM" -e SPEC_CFG="$SPEC_CFG"
   -e PAR_PREFILLS="$PAR_PREFILLS" -e PREFILL_POLICY="$PREFILL_POLICY"
+  -e PREFILL_COMPUTE_SHARE="$PREFILL_COMPUTE_SHARE" -e PREFILL_TOKENS_PER_STEP="$PREFILL_TOKENS_PER_STEP"
   -e MALLOC_ARENA_MAX=2
   -e EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS"
   -v "$MODEL_DIR:/model:ro"

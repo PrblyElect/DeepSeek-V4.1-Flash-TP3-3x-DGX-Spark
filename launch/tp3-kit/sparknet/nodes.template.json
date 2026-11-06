@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "ssh_user": "your-user",
+  "nodes": [
+    {
+      "name": "spark-head",
+      "rank": 0,
+      "management_ip": "192.168.0.10",
+      "head": true,
+      "management_interface": "EDIT_ME_MGMT_IF",
+      "roce_peer_hcas": {
+        "1": [
+          "EDIT_ME_HCA_TO_RANK1"
+        ],
+        "2": [
+          "EDIT_ME_HCA_TO_RANK2"
+        ]
+      },
+      "roce_subnets": {
+        "EDIT_ME_HCA_TO_RANK1": "10.10.1.0/24",
+        "EDIT_ME_HCA_TO_RANK2": "10.10.2.0/24"
+      }
+    },
+    {
+      "name": "spark-a",
+      "rank": 1,
+      "management_ip": "192.168.0.11",
+      "head": false,
+      "management_interface": "EDIT_ME_MGMT_IF",
+      "roce_peer_hcas": {
+        "0": [
+          "EDIT_ME_HCA_TO_RANK0"
+        ],
+        "2": [
+          "EDIT_ME_HCA_TO_RANK2"
+        ]
+      },
+      "roce_subnets": {
+        "EDIT_ME_HCA_TO_RANK0": "10.10.1.0/24",
+        "EDIT_ME_HCA_TO_RANK2": "10.10.0.0/24"
+      }
+    },
+    {
+      "name": "spark-b",
+      "rank": 2,
+      "management_ip": "192.168.0.12",
+      "head": false,
+      "management_interface": "EDIT_ME_MGMT_IF",
+      "roce_peer_hcas": {
+        "0": [
+          "EDIT_ME_HCA_TO_RANK0"
+        ],
+        "1": [
+          "EDIT_ME_HCA_TO_RANK1"
+        ]
+      },
+      "roce_subnets": {
+        "EDIT_ME_HCA_TO_RANK0": "10.10.2.0/24",
+        "EDIT_ME_HCA_TO_RANK1": "10.10.0.0/24"
+      }
+    }
+  ]
+}
