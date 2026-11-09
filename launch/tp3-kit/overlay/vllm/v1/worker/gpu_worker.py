@@ -1,7 +1,12 @@
-# CHANGES (RECIPE OVERLAY, sparknet freeze, 2026-11): derived from the
-# image's Apache-2.0 file. The only change: an 8-line hasattr-guarded
-# post-warmup sparknet kernel-resolution freeze. Stock when sparknet is
-# not loaded.
+# CHANGES (RECIPE OVERLAY, sparknet freeze + engine cost grid, 2026-11):
+# derived from the image's Apache-2.0 file. Two changes: (1) an 8-line
+# hasattr-guarded post-warmup sparknet kernel-resolution freeze; (2) one
+# ADDITIVE method, Worker.engine_grid, that times the engine's dummy steps
+# server-side with CUDA events and returns the engine's own target/drafter
+# split -- the instrument a published reference implementation uses for its
+# per-shape step-cost grid. It is reachable only through the dev-mode
+# collective RPC, so it is inert unless dev mode is switched on. Stock
+# behaviour is preserved when sparknet is not loaded.
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """A GPU worker class."""
@@ -1630,6 +1635,77 @@ class Worker(WorkerBase):
                     # Proton output names are fixed when the wrapper is constructed.
                     # Recreate it so the next profile_prefix is honored.
                     self.profiler = None
+
+    def engine_grid(self, spec: str) -> dict:
+        """The engine cost grid, for the dev-mode collective RPC (args arrive as
+        strings: ``spec`` is JSON).
+
+        Ported from a published reference implementation's engine-grid patch
+        into this kit overlay, so this recipe's cost grid is measured with
+        the SAME instrument as that reference's published grid: server-side
+        dummy fixed-shape steps, CUDA events around each step, and the
+        engine's own target/drafter split.
+
+        Shapes carry ``num_tokens`` (the batch's total rows), optional
+        ``num_reqs``, ``context_len`` and ``prefill``. The steps are the cost
+        profile's dummy runs: identical work every time, with no text, no
+        draft acceptance and no scheduling in them, so the numbers are the
+        engine's speed alone. Run it on an idle server, and reset the prefix
+        cache afterwards, since dummy steps write KV slots.
+        """
+        import json
+
+        spec = json.loads(spec)
+        shapes = spec["shapes"]
+        replays = int(spec.get("replays", 30))
+        warmup = int(spec.get("warmup", 2))
+        runner = self.model_runner
+
+        def run(shape: dict) -> None:
+            kwargs: dict[str, Any] = {
+                "num_tokens": int(shape["num_tokens"]),
+                "context_len": int(shape.get("context_len", 0)),
+            }
+            if shape.get("prefill"):
+                kwargs["single_request_prefill"] = True
+            elif shape.get("num_reqs") is not None:
+                kwargs["profile_num_reqs"] = int(shape["num_reqs"])
+            runner._dummy_run(**kwargs)
+
+        for shape in shapes:
+            for _ in range(warmup):
+                run(shape)
+        order: list[int] = []
+        events: list[tuple[Any, Any]] = []
+        with runner.step_timing.collect() as timings:
+            for replay in range(replays):
+                indices = range(len(shapes))
+                for index in indices if replay % 2 == 0 else reversed(indices):
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    run(shapes[index])
+                    end.record()
+                    events.append((start, end))
+                    order.append(index)
+        torch.cuda.synchronize()
+        results = [
+            {"shape": shape, "step_ms": [], "forward_ms": [], "drafter_ms": [], "modes": []}
+            for shape in shapes
+        ]
+        for index, (start, end) in zip(order, events):
+            # The whole dummy run on the stream: target, drafter and every gap
+            # between their kernels.
+            results[index]["step_ms"].append(start.elapsed_time(end))
+        # The target/drafter split exists only when every run reached the drafter.
+        if len(timings) == len(order):
+            for index, sample in zip(order, timings):
+                results[index]["forward_ms"].append(sample.forward_ms)
+                results[index]["drafter_ms"].append(sample.drafter_ms)
+                results[index]["modes"].append(
+                    [sample.full_cudagraph, sample.num_target_tokens, sample.num_reqs]
+                )
+        return {"replays": replays, "warmup": warmup, "shapes": results, "rank": self.rank}
 
     def execute_dummy_batch(self) -> None:
         num_tokens = getattr(self.model_runner, "uniform_decode_query_len", 1)

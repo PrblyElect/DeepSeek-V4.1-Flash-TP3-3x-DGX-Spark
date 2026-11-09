@@ -25,8 +25,12 @@
 # the capacity overlay ~5.1M tokens), ctx 1048576 (1M; the reservation
 # pins the pool, not ctx), parallel prefills
 # x2 + decode-aware (a short request's first token beside a deep prefill
-# drops from tens of seconds to under five, at no measurable long-prefill
-# cost), b12x kernel autotune OFF (heuristic plans ship as prebuilt
+# drops from tens of seconds to single-digit seconds, at no measurable
+# long-prefill cost), a static decode-under-prefill share of 0.2 plus a
+# 2048/step contended-prefill cap (a short request DECODING beside that
+# same prefill: ~1.4 -> ~25 tok/s; the price is ~+1 s on that first-token
+# time; the measured ladder sits on the PREFILL_COMPUTE_SHARE comment),
+# b12x kernel autotune OFF (heuristic plans ship as prebuilt
 # cubins; boots in roughly half the tuned time, decode parity, a few
 # percent slower one-time cold prefill), speculative decoding OFF --
 # REJECTED: the drafter's ~3 GiB/rank residency OOMs the head on the
@@ -104,16 +108,21 @@ CTX="${CTX:-1048576}"                     # 1M, measured and kept: pool bytes/bl
 MNBT="${MNBT:-${MAX_NUM_BATCHED_TOKENS:-8192}}"   # chunked-prefill batch width. 16384 REJECTED (worker OOM during compile at gmu 0.85); 8192 is the proven posture. Retest only with a memory plan
 LIMIT_MM="${LIMIT_MM:-{\"image\": 32}}"               # vision: images per prompt (0 = tower stubbed); each image caps at 1,024 tokens
 # Parallel prefills — measured and kept ("2"): a short request's first token
-# beside a deep prefill drops from tens of seconds to under five, at no
-# measurable cost to the long prefill (the shared chunk budget absorbs the
-# small prefill in the big one's inter-chunk gaps). "1" restores legacy
-# single-lane behavior. The policy requires max-parallel-prefills > 1
-# (engine-side validation) and is only passed when the count is above 1.
+# beside a deep prefill drops from tens of seconds to single-digit
+# seconds, at no measurable cost to the long prefill (the shared chunk
+# budget absorbs the small prefill in the big one's inter-chunk gaps).
+# Where it lands inside that band is set by the decode-under-prefill share
+# below (~4.6-4.8 s at shares 0.3-0.5, ~5.8 s at the shipped 0.2).
+# "1" restores legacy single-lane behavior. The policy requires
+# max-parallel-prefills > 1 (engine-side validation) and is only passed
+# when the count is above 1.
 PAR_PREFILLS="${PAR_PREFILLS:-2}"
 PREFILL_POLICY="${PREFILL_POLICY:-decode-aware}"
-# Decode-under-prefill share — KEEP (measured 2026-11): 0.5 static + 2048/step cap;
-# see the bootstrap comment for the measured why. Empty ("") = legacy behavior.
-PREFILL_COMPUTE_SHARE="${PREFILL_COMPUTE_SHARE:-0.5}"
+# Decode-under-prefill share — KEEP (measured 2026-11): 0.2 static + 2048/step cap;
+# see the bootstrap comment for the measured why. Empty ("") = legacy behavior:
+# the ENGINE flag is then omitted (no --prefill-compute-share), though the
+# container's ENV still carries an empty PREFILL_COMPUTE_SHARE.
+PREFILL_COMPUTE_SHARE="${PREFILL_COMPUTE_SHARE-0.2}"
 PREFILL_TOKENS_PER_STEP="${PREFILL_TOKENS_PER_STEP:-2048}"
 # Row 13 (KEEP, 2026-11): the b12x loader routes checkpoint views through an
 # asynchronous read ring (O_DIRECT bounce buffers on GB10 - read_mode=auto
@@ -247,6 +256,30 @@ src = src.replace(
 p.write_text(src)
 print("artifacts.py patched (valid_object shim)")
 PY
+fi
+# b12x direct-routing threshold (2026-11, measured). The dynamic MoE takes
+# DIRECT routing while routed_rows <= _DIRECT_ROUTING_MAX_ROUTED_ROWS (32):
+# one full expert weight stream PER ROUTE, no union gather. Above 32 it
+# gathers the UNION of the batch's experts and streams each once. At top-6 a
+# 4-row verify is 24 routed rows -> direct, so the same expert is streamed
+# twice (a measured arbitration prices that duplication at ~6.7 ms/step). Setting
+# B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS patches the constant in-container
+# BEFORE anything imports the module. The patch is VERIFIED -- the old text
+# must appear exactly once, or the boot fails loudly rather than silently
+# running the incumbent. OPT-IN: unset (the default) means the incumbent
+# behaviour, byte-identical.
+if [ -n "${B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS:-}" ]; then
+  python3 - "$B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS" <<'PY'
+import pathlib, sys
+want = int(sys.argv[1])
+p = pathlib.Path("/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/fused_moe/_impl.py")
+src = p.read_text()
+old = "_DIRECT_ROUTING_MAX_ROUTED_ROWS = 32"
+assert src.count(old) == 1, f"expected exactly one {old!r}, found {src.count(old)}"
+p.write_text(src.replace(old, f"_DIRECT_ROUTING_MAX_ROUTED_ROWS = {want}"))
+print(f"b12x direct-routing threshold patched: 32 -> {want}")
+PY
+  echo "[ds41-fork] b12x union-routing patch installed (threshold $B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS)"
 fi
 # KV-capacity accounting overlay (the steady/transient split, class of
 # the open upstream PR #52495; measured):
@@ -391,14 +424,42 @@ PREFILL_FLAGS=""
 if [ "${PAR_PREFILLS:-1}" != "1" ]; then
   PREFILL_FLAGS="--max-parallel-prefills ${PAR_PREFILLS} --prefill-policy ${PREFILL_POLICY}"
 fi
-# Decode-under-prefill share (KEPT 2026-11, three-boot ladder): a
+# Decode-under-prefill share (KEPT 2026-11, measured ladder): a
 # short request decoding beside a deep prefill crawls at 1.4 tok/s on the
 # default posture (the scheduler alternates PURE steps, so a mixed-step cap
 # is a no-op — a measured boot refuted --max-num-scheduled-tokens). A STATIC
-# prefill-compute-share 0.5 + a 2048/step contended-prefill cap lifts that
-# decode to 8.2-9.6 tok/s (~6.5x) at ZERO idle cost (solo 26.1-28.9 tok/s,
-# TTFT 0.46-0.73s vs the 29.2/0.5s baseline) and a +2-11% deep-prefill
-# wall. "auto" is explicitly NOT the keep: it charged ~15% idle decode and
+# prefill-compute-share + a 2048/step contended-prefill cap fixes it. 0.5 was
+# the first keep: it lifted that decode from 1.4 to 8.2-9.6 tok/s (~6.5x) at
+# ZERO idle cost (solo 26.1-28.9 tok/s, TTFT 0.46-0.73s vs the 29.2/0.5s
+# baseline) and a +2-11% deep-prefill wall.
+#
+# 0.3 then moved it and the whole trade was measured pairwise:
+# decode-under-prefill ~15.4 -> ~22.3 tok/s (+~45 %), short-request TTFT
+# ~4.6 -> ~4.7 s (+~3 %), idle decode unchanged (~36), the deep prefill's
+# wall FLAT (~87 -> ~86 s — the anticipated +27-31 % price did not
+# appear), MemFree ~2 GB, 0 preemptions, and no capability change (a
+# 14-point capability check passed unchanged).
+#
+# 0.2 then moved it again, measured against a concurrent control with
+# the arrival schedule fixed, so the arrival-phase profile cancels
+# instead of being averaged over:
+# decode-under-prefill ~22.2 -> ~25.0 tok/s (+~13 %, the widened 95 %
+# interval spanning roughly +11 to +14 %; an initial pass read the same
+# effect at +~13 %), the prefill's charged contended seconds/pair ~7.5 ->
+# ~6.2 and the split ~51 % -> ~46 % (the mechanism: less contended time
+# charged to the prefill), the deep prefill's wall FLAT (~86 s in every
+# arm), idle decode unchanged (~36), MemFree ~1.7-1.8 GB, 0 preemptions,
+# and no capability change (the same 14-point check, passed). Those
+# measurements could only BOUND the short-request TTFT price (point
+# ~+0.4 s, ~+8 %; bounded at <= +25 % -- the ceiling the trade was
+# measured against). Same-boot A/B comparisons (the engine's runtime
+# share setter, so no cross-boot term exists by construction) settled
+# it: TTFT +~7 % with the whole 95 % interval inside the +25 % ceiling,
+# buying decode-under-prefill +~13 % -- reproduced on independent boots
+# both times. NOTE the knob is the PREFILL
+# fraction on this pin (0.2 = prefill 20 % / decode 80 %), so 0.7 would
+# have made the contention WORSE, not better.
+# "auto" is explicitly NOT the keep: it charged ~15% idle decode and
 # 1.6-4.3s TTFT (boot the pre-change record). Set PREFILL_COMPUTE_SHARE="" to restore the
 # legacy behavior.
 if [ -n "${PREFILL_COMPUTE_SHARE:-}" ]; then
@@ -648,6 +709,20 @@ run_args=(
   -e VLLM_ENABLE_PCIE_ALLREDUCE=0
   -e B12X_AUTOTUNE="$B12X_AUTOTUNE"
   -e B12X_W4A8_TINY_DECODE="$B12X_W4A8_TINY_DECODE"
+  # the b12x dynamic kernel's work source (2026-11). "materialized_queue" is
+  # the production default and is the value in force previously: it
+  # takes DIRECT routing while routed_rows <= 32 (_impl.py:2259), i.e. one full
+  # expert weight stream PER ROUTE, so a multi-row verify streams the same
+  # expert twice. "ready_queue" disables the direct-routing predicate
+  # (_impl.py:1992) and the routing falls back to GROUPED -- the union of the
+  # batch's experts, streamed once each. Default below = the incumbent value,
+  # so a boot without the variable reproduces today's behaviour exactly and the
+  # arm is undone by removing the variable.
+  -e B12X_DYNAMIC_WORK_SOURCE="${B12X_DYNAMIC_WORK_SOURCE:-materialized_queue}"
+  # the b12x direct-routing threshold: the bootstrap patches the
+  # library's _DIRECT_ROUTING_MAX_ROUTED_ROWS in-container when this is set.
+  # Empty (the default) = no patch = the incumbent routing, byte-identical.
+  -e B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS="${B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS:-}"
   -e VLLM_DS41_L2_PREFETCH="${VLLM_DS41_L2_PREFETCH:-1}"
   # the budget sweep (2026-11): the per-window L2-prefetch fill budgets. GB10's L2 is
   # 24 MB and one layer's live working set is the WO + FFN + NEXT windows
@@ -697,6 +772,10 @@ run_args=(
   -e PREFILL_COMPUTE_SHARE="$PREFILL_COMPUTE_SHARE" -e PREFILL_TOKENS_PER_STEP="$PREFILL_TOKENS_PER_STEP"
   -e MALLOC_ARENA_MAX=2
   -e EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS"
+  # The engine cost grid's instrument (servebench's engine_grid) lives
+  # behind the dev-mode collective RPC; it is used only while measuring
+  # an engine cost grid. Off by default.
+  -e VLLM_SERVER_DEV_MODE="${VLLM_SERVER_DEV_MODE:-0}"
   -v "$MODEL_DIR:/model:ro"
   -v "$KIT_DIR:/kit:ro"
   --entrypoint /bin/bash
