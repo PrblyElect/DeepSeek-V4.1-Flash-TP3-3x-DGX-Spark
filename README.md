@@ -186,6 +186,7 @@ kernel autotune off, no spec decode, engram on NVMe):
 | TTFT (short prompt, idle) | 1–2 s |
 | TTFT (short prompt beside a deep prefill) | **≈5–6 s** at the shipped share 0.2 (≈4.6–4.8 s at 0.3–0.5; tens of seconds before parallel prefills; the deep prefill itself is unaffected) |
 | Decode beside a deep prefill | ~1.4 tok/s on the legacy scheduler → **~25 tok/s** at the shipped share (the ladder and its TTFT price: failure mode 16) |
+| Aggregate decode (counting-task prompts, idle lane) | 1× **~34** · 2× **~53** · 4× **~70** · 8× **~103** tok/s (per-stream at 8×: ~12-19 wall-based; the engine step time saturates around 45 ms from 4× up — the MoE grouped path carries the batch) |
 | Weights per rank | 95.4 GiB |
 | KV reservation | **5 GB (4.7 GiB)** (fixed by `--kv-cache-memory-bytes`; with the capacity overlay the pool reads ~5.1M at both contexts) |
 | Context length | **1,048,576 (1M)** — verified by deep-prefill admission to ~900K at the shipped batch width |
