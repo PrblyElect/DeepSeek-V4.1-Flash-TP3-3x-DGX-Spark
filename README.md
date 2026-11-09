@@ -22,9 +22,11 @@ block count (roughly 5.1M tokens at 1M with the capacity overlay — one full
 1M request fits with room to spare). **~35 tok/s single-stream** (prose,
 no spec decode — the LM-head kernel, L2 set-aside and loader below are all
 part of the shipped posture), a cold boot loads the weights in **~32 s**
-(b12x O_DIRECT loader), and a short request's first token lands in **under five
-seconds even beside a deep multi-hundred-K prefill** (parallel prefills,
-measured — see FIXLOG). Engram n-gram tables are served from NVMe,
+(b12x O_DIRECT loader), and a short request's first token lands in
+**single-digit seconds even beside a deep multi-hundred-K prefill**
+(parallel prefills + the decode-under-prefill share, measured — see
+FIXLOG), while a short request *decoding* beside that same prefill runs
+at ~25 tok/s instead of the legacy ~1.4. Engram n-gram tables are served from NVMe,
 freeing 31 GiB/rank of host memory that would otherwise be consumed.
 The bring-up maps every memory trap on GB10 unified memory: NCCL buffer
 pinning, engram host staging, loader bounce buffers, and the startup
@@ -133,14 +135,15 @@ the defect class this recipe has already been bitten by.
 ## Served numbers
 
 Measured at the shipped configuration (gmu 0.85, 5 GiB KV + the capacity overlay, 1M context,
-parallel prefills ×2 + decode-aware policy, kernel autotune off, no spec
-decode, engram on NVMe):
+parallel prefills ×2 + decode-aware policy, decode-under-prefill share 0.2,
+kernel autotune off, no spec decode, engram on NVMe):
 
 | Metric | Value |
 |---|---|
 | Single-stream decode (prose) | ~35 tok/s (b12x MoE + LM-head kernel + L2 set-aside; ~31 without the 2026-11 kernel stack) |
 | TTFT (short prompt, idle) | 1–2 s |
-| TTFT (short prompt beside a deep prefill) | **under 5 s** (was tens of seconds before parallel prefills; the deep prefill itself is unaffected) |
+| TTFT (short prompt beside a deep prefill) | **≈5–6 s** at the shipped share 0.2 (≈4.6–4.8 s at 0.3–0.5; tens of seconds before parallel prefills; the deep prefill itself is unaffected) |
+| Decode beside a deep prefill | ~1.4 tok/s on the legacy scheduler → **~25 tok/s** at the shipped share (the ladder and its TTFT price: failure mode 16) |
 | Weights per rank | 95.4 GiB |
 | KV reservation | **5 GiB** (fixed by `--kv-cache-memory-bytes`; with the capacity overlay the pool reads ~5.1M at both contexts) |
 | Context length | **1,048,576 (1M)** — verified by deep-prefill admission to ~900K at the shipped batch width |
@@ -245,7 +248,7 @@ The trade-off table:
 | Context | **1M** | 262K (their "256k limit") |
 | Concurrency @ 1M | **~4.9×** | — |
 | Speed | ~35 tok/s | **51 tok/s** |
-| Short TTFT beside deep prefills | **< 5 s** (parallel prefills) | not published |
+| Short TTFT beside deep prefills | **≈5–6 s** (parallel prefills + decode share) | not published |
 | Spec decode | off (rejected — see below) | on (speed) |
 | Engine | vLLM (eugr b12x) | SGLang (custom) |
 
@@ -384,6 +387,8 @@ CTX=1048576                        # 1M; pool bytes/blocks unchanged by this kno
 KV_CACHE_MEMORY_BYTES=5g
 PAR_PREFILLS=2                     # short-request TTFT beside deep prefills (see FIXLOG);
 PREFILL_POLICY=decode-aware        # requires the count above 1
+PREFILL_COMPUTE_SHARE=0.2          # decode-under-prefill share, shipped posture (FIXLOG mode 16)
+PREFILL_TOKENS_PER_STEP=2048       # the contended-prefill cap paired with it
 B12X_AUTOTUNE=0                    # heuristic cubin plans: ~half boot time, decode parity
 
 # Serving
