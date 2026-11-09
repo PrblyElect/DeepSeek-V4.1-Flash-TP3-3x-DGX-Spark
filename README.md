@@ -189,8 +189,8 @@ kernel autotune off, no spec decode, engram on NVMe):
 | Aggregate decode (counting-task prompts, idle lane) | 1× **~34** · 2× **~53** · 4× **~70** · 8× **~103** tok/s (per-stream at 8×: ~12-19 wall-based; the engine step time saturates around 45 ms from 4× up — the MoE grouped path carries the batch) |
 | Weights per rank | 95.4 GiB |
 | KV reservation | **5 GB (4.7 GiB)** (fixed by `--kv-cache-memory-bytes`; with the capacity overlay the pool reads ~5.1M at both contexts) |
-| Context length | **1,048,576 (1M)** — verified by deep-prefill admission to ~900K at the shipped batch width |
-| Concurrency at 1M ctx | **~4.9×** — pool depth, not simultaneous streams (`MAX_NUM_SEQS=8` caps live sequences; see the note under Configuration) |
+| Context length | **1,048,576 (1M)** — verified by the concurrent admission and prefill of two full 1M contexts (~3.4K tok/s aggregate, a ~2.1 GB free-memory trough) |
+| Concurrency at 1M ctx | **~4.9×** — pool depth, not simultaneous streams; two full-1M requests verified live (`MAX_NUM_SEQS=8` caps live sequences; see the note under Configuration) |
 | Concurrency at 512K ctx | **~9.7×** — pool depth, as above |
 | Cold boot (load→health) | a few minutes (weight load ~32 s with the b12x loader, ~190 s on the safetensors fallback; the first boot pays kernel compilation, later boots save ~60 s via the persistent cache) |
 | Temp-0 determinism | identical across runs for most prompts (gate 2). A narrow tie class exists: prompts whose forced answer has an equally-likely variant (a trailing period, a formatting choice) can flip across boots and warm/cold states at temp 0 — measured on three postures, unchanged by context or scheduler knobs. Treat single-word temp-0 outputs as acceptance checks, not correctness proofs. The long-prompt path is a separate gate (9). |
