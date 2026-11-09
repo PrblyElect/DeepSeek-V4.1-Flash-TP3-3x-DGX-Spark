@@ -767,17 +767,39 @@ the distinction matters for anyone re-trying it:
    boot at a reduced 2.3 GiB KV pool **allocates the pool, captures its
    CUDA graphs, and serves** — the first spec boot on this hardware to
    get that far.
-3. **The real wall is steady state, and it is fatal.** Roughly a minute
-   into its first deep-context prefill (a few hundred K tokens — exactly
-   the RAG shape this recipe exists for), the head rank was
-   kernel-OOM-killed: the drafter's ~3 GiB/rank residency leaves the
-   head unable to absorb the deep-prefill memory transient at any pool
-   that leaves the drafter room. Smaller pools cut concurrency toward
-   the 50% line without adding headroom; the failure is the prefill
-   transient, not a per-sequence buffer.
+3. **The first wall was steady state — an October boot's head rank was
+   kernel-OOM-killed a minute into its first deep-context prefill.**
+   That boot's reading ("fatal at any pool that leaves the drafter
+   room") is **superseded by a later re-test**: on the 2026-11 stack
+   (KV-capacity overlay, both tuners off) the same 2.3 GiB spec pool
+   **serves** deep prefills — two concurrent 512K prefills verified at
+   a ~1.7 GB trough, and a ~350K deep prefill beside a decoding short
+   request runs clean at ~1.9 GB free. The drafter's ~3 GiB/rank
+   residency is real; what it buys is a **pool cut**, not an OOM.
 
-The conclusion: on this pin, DSpark cannot serve this recipe's own
-deep-context workload at any knob setting. Reopening it requires more
+The conclusion — **a capacity rejection, not a speed or stability one**:
+the spec profile runs at a **~2.1M-token pool (~2× at 1M context)**
+against this recipe's ~5.1M (~4.9×), with a thin margin above the
+memory floor — it cannot carry the deep-concurrent RAG workload this
+recipe exists for. Re-verified on the shipped 2026-11 stack
+(LM-head kernel, L2 set-aside, decode-under-prefill share 0.2):
+
+- single-stream aggregate **~70 tok/s** on counting-task prompts —
+  **about 2× the plain lane's single-stream** — prose **~47**, with
+  ~4.7 s first-token beside a ~350K prefill (better than the plain
+  lane: the drafter's parallel drafts shorten the short request's own
+  decode)
+- aggregate **~140 tok/s at 8 streams**, and the sweep is **not
+  monotone**: the 2-stream point dips below 1-stream (the MoE grouped
+  path at 12 routed rows — the same regime the union-routing knob
+  prices)
+- the shipped decode-under-prefill share carries into spec
+  (~15 tok/s decoding beside a deep prefill, against ~70 solo)
+
+So the trade is exactly: **~2× single-stream for half the pool.** For
+this recipe's capacity-first mission the answer stays no; a
+throughput-shaped deployment with shallower contexts could take it
+tomorrow on these numbers. Reopening at full capacity requires more
 memory per rank (a 64 KiB-page kernel, the display carve-out) or a
 smaller *trained* drafter — engine/OS projects, not flags. The
 zero-weight alternative (n-gram prompting off the request's own tokens)
