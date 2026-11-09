@@ -15,51 +15,59 @@ tags:
 **TL;DR** — Serve DeepSeek-V4.1-Flash (552B total, native FP4+FP8 MoE
 with a 196B engram conditional-memory block) tensor-parallel across three
 DGX Sparks on a 200G CX-7 RoCE triangle, using the eugr b12x vLLM fork
-on a public Docker Hub image. Capacity-optimized: a **5 GiB KV
+on a public Docker Hub image. Capacity-optimized: a **5 GB (4.7 GiB) KV
 reservation** at **1M context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
 block count (roughly 5.1M tokens at 1M with the capacity overlay — one full
-1M request fits with room to spare). **~35 tok/s single-stream** (prose,
+1M request fits by pool arithmetic; admission is verified to ~900K). **~35 tok/s single-stream** (prose,
 no spec decode — the LM-head kernel, L2 set-aside and loader below are all
 part of the shipped posture), a cold boot loads the weights in **~32 s**
-(b12x O_DIRECT loader), and a short request's first token lands in
+(b12x O_DIRECT loader). A short request's first token lands in
 **single-digit seconds even beside a deep multi-hundred-K prefill**
 (parallel prefills + the decode-under-prefill share, measured — see
-FIXLOG), while a short request *decoding* beside that same prefill runs
-at ~25 tok/s instead of the legacy ~1.4. Engram n-gram tables are served from NVMe,
+FIXLOG). And a short request *decoding* beside that same prefill runs
+at **~25 tok/s** — the legacy scheduler gave it ~1.4. Engram n-gram tables are served from NVMe,
 freeing 31 GiB/rank of host memory that would otherwise be consumed.
 The bring-up maps every memory trap on GB10 unified memory: NCCL buffer
 pinning, engram host staging, loader bounce buffers, and the startup
 free-memory check — each with its measured fix.
 
-**A published vLLM TP3 recipe for V4.1-Flash on a publicly available
-image.** This one is three commands with a pre-built image. The field moves
-fast — check the community indexes before repeating the "only" claim.
+(b12x is the kernel lineage of these images — it prefixes their env
+vars, the MoE backend and the loader; "the b12x fork" below means this
+image family.)
 
-**This is not the only three-node TP=3 recipe on the public image.** The
-project that publishes the image now ships its own
-`recipes/3x-spark-cluster/deepseek-v4.1-flash.yaml` — the same model, the
-same image lineage, the same three-node shape. It is a recipe for their
-cluster runner, with no acceptance gates of its own, and it asks for a
-smaller KV pool and fewer concurrent sequences than this one, and a
-context derived from that pool. The difference between the two is the trade this recipe makes;
+**Contents** — Quick start · Served numbers · The decode-step stack ·
+One-shot RoCE transport (optional) · Why capacity over speed · The
+bring-up: six walls · Troubleshooting · Stack · Configuration ·
+Re-audit triggers · Hardware · Engram on NVMe · Vision · Speculative
+decode · Comparison · Upstream's own 3-node recipe · Credits · License
+
+**A published vLLM TP3 recipe for V4.1-Flash on a publicly available
+image — three commands to a serving lane, with acceptance gates.** The
+project that publishes the image also ships its own
+`recipes/3x-spark-cluster/deepseek-v4.1-flash.yaml` — the same model,
+the same image lineage, the same three-node shape, for their cluster
+runner. The difference between the two is the trade this recipe makes;
 the side-by-side is in **Upstream's own 3-node recipe** below, and where
 they differ, that table is the reason this recipe reads the way it does.
 
 The scope here is the public image, not the B12X kernel lineage: a
-community TP=3 vLLM fork built from source reaches a larger pool (up to
-5.5M tokens on three nodes) and a larger context (1M) on both its three-
-and four-node shapes — with a 64 KiB-page kernel and the memory saver; on
-a stock 4 KiB-page box its three-node shape is 256K. Its figures are in the
-table below. The speed-optimized SGLang recipe from the community achieves higher tok/s
-but at about a third of the KV capacity and half the context — see
-**Comparison** below.
+community TP=3 vLLM fork built from source reaches a slightly larger
+pool (5.5M vs ~5.1M tokens) at the same 1M context when built with a
+64 KiB-page kernel and the memory saver; on a stock 4 KiB-page box its
+three-node shape is 256K. Its figures are in the table below. The
+speed-optimized SGLang recipe from the community achieves higher tok/s
+but at about a seventh of the KV capacity and a quarter of the context —
+see **Comparison** below.
 
-Prerequisites: three DGX Sparks wired as a full CX-7 RoCE triangle (three
-cables, each box connected to the other two, one /24 per pair of boxes,
-MTU 9000) plus a management LAN, the ~510 GB checkpoint
-and the digest-pinned image staged on every box, and Docker with GPU
-support.
+Prerequisites:
+
+- three DGX Sparks wired as a full CX-7 RoCE triangle (three cables,
+  each box connected to the other two, one /24 per pair, MTU 9000)
+  plus a management LAN
+- the ~510 GB checkpoint staged on every box (**Staging**, below)
+- the digest-pinned image staged on every box (**Staging**, below)
+- Docker with GPU support on every box
 
 ## Quick start
 
@@ -71,13 +79,33 @@ on each box — and `NCCL_SOCKET_IFNAME`, the management interface). The
 preflight refuses to run while the fabric selectors still hold their
 placeholder.
 
-Then stage the checkpoint and the digest-pinned image on all three
-boxes, and:
+### Staging the checkpoint and the image (once per box)
+
+```sh
+# the image, pinned by digest (a tag can move; a digest cannot)
+docker pull eugr/spark-vllm-b12x@sha256:03a956544e9f9b4b7ba91690469fbe7848bdbef29a7d2e0f5788368467bb3595
+
+# the checkpoint (~510 GB) into MODEL_DIR on every box
+hf download deepseek-ai/DeepSeek-V4.1-Flash-1017 \
+  --revision 1bae0e10 --local-dir "$MODEL_DIR"
+```
+
+The boot gate proves the checkpoint directory is a complete snapshot: it
+expects 48 shards at the root (engram included), the 12 engram index
+entries, and a `_DOWNLOAD_COMPLETE.json` marker. `hf download` does not
+write that marker — create it yourself **after** the download has fully
+completed, so the gate is checking your honest claim:
+
+```sh
+echo '{"complete": true}' > "$MODEL_DIR/_DOWNLOAD_COMPLETE.json"
+```
+
+Then:
 
 ```sh
 ./launch/ds41-flash-tp3-up preflight    # image digest + content, checkpoint, fabric
 ./launch/ds41-flash-tp3-up stage-env     # copies cluster.env + launcher + tp3-kit
-./launch/ds41-flash-tp3-up start --yes   # head first, then the workers; :8600 in a few minutes
+./launch/ds41-flash-tp3-up start --yes   # head first, then the workers; the API is on :8600 a few minutes later
 ```
 
 `preflight` is read-only: it inspects the image that is already on the
@@ -85,6 +113,20 @@ box and never pulls. It checks three things per box — the image's
 manifest digest matches `IMAGE_DIGEST`, the sha256 of the image's
 RootFS layer list matches `IMAGE_CONTENT_SHA256`, and the checkpoint
 directory is present — then reports the box's available memory.
+
+### First request
+
+When health is green, one request proves the lane answers (the full
+acceptance suite — ten gates with expected outputs — is
+`docs/VALIDATION.md`):
+
+```sh
+curl http://HEAD_IP:8600/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "main", "messages": [{"role": "user", "content": "Reply with the single word: ready"}], "max_tokens": 8, "temperature": 0}'
+```
+
+Expect HTTP 200, a short completion, and `finish_reason: "stop"`.
 
 `stage-env` copies `config/cluster.env`, `launch/start-tp3-fork.sh` and
 the `launch/tp3-kit/` gate into `~/ds41-flash-tp3/` on every box. The
@@ -134,7 +176,7 @@ the defect class this recipe has already been bitten by.
 
 ## Served numbers
 
-Measured at the shipped configuration (gmu 0.85, 5 GiB KV + the capacity overlay, 1M context,
+Measured at the shipped configuration (gmu — `--gpu-memory-utilization` — 0.85, 5 GB (4.7 GiB) KV + the capacity overlay, 1M context,
 parallel prefills ×2 + decode-aware policy, decode-under-prefill share 0.2,
 kernel autotune off, no spec decode, engram on NVMe):
 
@@ -145,16 +187,23 @@ kernel autotune off, no spec decode, engram on NVMe):
 | TTFT (short prompt beside a deep prefill) | **≈5–6 s** at the shipped share 0.2 (≈4.6–4.8 s at 0.3–0.5; tens of seconds before parallel prefills; the deep prefill itself is unaffected) |
 | Decode beside a deep prefill | ~1.4 tok/s on the legacy scheduler → **~25 tok/s** at the shipped share (the ladder and its TTFT price: failure mode 16) |
 | Weights per rank | 95.4 GiB |
-| KV reservation | **5 GiB** (fixed by `--kv-cache-memory-bytes`; with the capacity overlay the pool reads ~5.1M at both contexts) |
+| KV reservation | **5 GB (4.7 GiB)** (fixed by `--kv-cache-memory-bytes`; with the capacity overlay the pool reads ~5.1M at both contexts) |
 | Context length | **1,048,576 (1M)** — verified by deep-prefill admission to ~900K at the shipped batch width |
-| Concurrency at 1M ctx | **~4.9×** |
-| Concurrency at 512K ctx | **~9.7×** |
+| Concurrency at 1M ctx | **~4.9×** — pool depth, not simultaneous streams (`MAX_NUM_SEQS=8` caps live sequences; see the note under Configuration) |
+| Concurrency at 512K ctx | **~9.7×** — pool depth, as above |
 | Cold boot (load→health) | a few minutes (weight load ~32 s with the b12x loader, ~190 s on the safetensors fallback; the first boot pays kernel compilation, later boots save ~60 s via the persistent cache) |
 | Temp-0 determinism | identical across runs for most prompts (gate 2). A narrow tie class exists: prompts whose forced answer has an equally-likely variant (a trailing period, a formatting choice) can flip across boots and warm/cold states at temp 0 — measured on three postures, unchanged by context or scheduler knobs. Treat single-word temp-0 outputs as acceptance checks, not correctness proofs. The long-prompt path is a separate gate (9). |
 | Tool calling (deepseek_v41) | working |
 | Reasoning parser (deepseek_v41) | working |
 
-(All gate numbers refer to `docs/VALIDATION.md`, which ships with the recipe.)
+(All gate numbers refer to `docs/VALIDATION.md`, which ships with the recipe.
+Figures are single-boot point estimates; boot-to-boot variance measured ≈2%.)
+
+**The capacity overlay** is a two-file patch the bootstrap installs before
+the boot gate (FIXLOG failure mode 15): stock KV accounting charges every
+request the worst-case span of all its sliding-window groups; the overlay
+charges each request its window+lookahead and the unsettled batches once —
+which is why the same 5 GB reservation reports ~5.1M tokens.
 
 ### Where the boot time goes
 
@@ -191,7 +240,7 @@ Persistence would have to come from a mount keyed by the image build
 stamp — a stale artifact is a *wrong kernel*, which is a worse failure
 than a slow boot — so this recipe ships neither knob changed.
 
-## The decode-step stack (all measured keeps, all one-line undo)
+## The decode-step stack (all measured and kept, all one-line undo)
 
 The ~35 tok/s figure is not one knob; it is the b12x MoE backend plus four
 additions landed and A/B-measured one variable at a time (see FIXLOG for the
@@ -209,12 +258,12 @@ failure modes that did not survive):
    first.
 
 Each of these is a launcher line or a kit overlay; removing the line
-restores the prior behaviour. The 0491 capacity overlay and the parallel
+restores the prior behaviour. The capacity overlay and the parallel
 prefill policy below are the same pattern.
 
 ## The one-shot RoCE transport (optional layer)
 
-The stock lane carries its TP all-reduce on NCCL over the triangle. The
+The stock configuration carries its TP all-reduce on NCCL over the triangle. The
 image's own one-shot RoCE collective cannot form on a one-cable-per-pair
 fabric (it demands two rails per peer pair — the bring-up gate was built on
 exactly that silent fallback). `tp3-kit/sparknet/` ships an optional layer
@@ -290,7 +339,7 @@ holds 95 GiB of weights. Fix:
 The tables stay on NVMe; rows are read on demand. This is the single
 setting that makes V4.1 bootable at TP3 on this hardware.
 
-### 3. The b12x loader's bounce buffers OOM on busy head nodes
+### 3. Weight loading: the b12x loader ships (~32 s); safetensors is the fallback
 
 **Updated (measured, 2026-11): the b12x loader is now the shipped default —
 with the capacity overlay and the 5 GiB posture it loads the same checkpoint
@@ -340,6 +389,14 @@ default seccomp profile blocks. Fix:
 ```sh
 --security-opt seccomp=unconfined
 ```
+
+## Troubleshooting
+
+The six walls above are the bring-up failures; the running symptom →
+root cause → fix table — including defects found in this recipe's own
+scripts during re-runs of the published quick start — is
+**`docs/FIXLOG.md`**. Diagnose forward from the symptom; nothing here
+rolls back automatically.
 
 ## Stack
 
@@ -395,8 +452,9 @@ B12X_AUTOTUNE=0                    # heuristic cubin plans: ~half boot time, dec
 PORT=8600
 TP=3
 MOE_BACKEND=b12x                      # the measured-keep MoE backend; empty = engine auto
-                                      # (DEEPGEMM_MXFP4). B12X_W4A8_TINY_DECODE=0 below is
-                                      # REQUIRED with b12x — it carries the SwiGLU clamp.
+                                      # (DEEPGEMM_MXFP4)
+B12X_W4A8_TINY_DECODE=0               # REQUIRED with b12x — it carries the SwiGLU clamp
+                                      # (FIXLOG failure mode 14)
 MAX_NUM_SEQS=8
 MAX_NUM_BATCHED_TOKENS=8192       # do not raise without a memory plan: 16384
                                   # OOM-killed both worker ranks during the b12x
@@ -417,7 +475,8 @@ NCCL_PROTO="^LL128"
 NCCL_MAX_NCHANNELS=8
 
 # Allocator
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False   # mandatory: :True → NaN logits
+                                                     # on >64-token prompts (FIXLOG 8)
 # the launcher also forwards MALLOC_ARENA_MAX=2 to the engine
 # (see "Where the boot time goes")
 
@@ -432,9 +491,9 @@ SERVED_MODEL_NAME=main
 Concurrency here means how many full-length requests fit in the KV pool.
 It is a capacity figure, not a promise about simultaneous streams: the
 shipped `--max-num-seqs 8` caps how many requests are served at once, so
-the higher end of the band (the ~9.7x figure at 512K) describes pool depth, not concurrency.
+the ~9.7× figure at 512K describes pool depth, not concurrency.
 
-### `BLOCK_SIZE=256` — what it is, and what `/metrics` will say
+### BLOCK_SIZE=256 — what it is, and what `/metrics` will say
 
 `BLOCK_SIZE=256` is not a free parameter: it is the block size the
 DeepSeek-V4.1 sparse-SWA attention backend reports as its **preferred**
@@ -617,7 +676,7 @@ difference matters. Once the weights are resident, the *measured*
 free memory on a loaded box can sit far below that estimate and moves
 with the page cache and the engram staging path: observed readings on
 a running triangle have ranged from a few tens of MiB to a few GiB,
-and the engine has been OOM-killed by the kernel at the low end. Treat
+and loads have been OOM-killed at the low end. Treat
 the headroom as a budget to measure, not a constant:
 
 - the bring-up drops the page cache before the load, which is what
@@ -661,7 +720,7 @@ So the posture this recipe already takes —
 `--engram-config '{"cpu_offload":false,"table_memory":"disk"}'`, the same
 setting upstream's own three-node recipe uses — is the answer, and there
 is no further work to do here. If a smaller checkpoint is ever wanted, an
-FP8 subset or a lower-bitpoint variant, that is a checkpoint question and
+FP8 subset or a lower-bit-width variant, that is a checkpoint question and
 it would change the arithmetic; it is not a prefetch question.
 
 ## Vision: built in, one flag
@@ -673,11 +732,8 @@ multimodal class unconditionally on this hardware and builds the tower;
 setting `LIMIT_MM` above zero turns it from stubbed to served:
 
 ```sh
-LIMIT_MM='{"image": 32}'  # images per prompt; 0 = text-only. Verified: a 12-image
-                          # ordered identification at 12/12 correct (~4 s); a full 32-image
-                          # batch processes in ~4 s (~185 tokens/image after downsampling).
-                          # Per-image identification stays strong at the limit; aggregate
-                          # counting drifts (30/32) — a known VLM scale behavior
+LIMIT_MM='{"image": 32}'  # images per prompt; 0 = text-only (the tower
+                          # is stubbed at 0, served above it)
 ```
 
 Verified live: exact shape/color/position recovery on a generated test
@@ -694,9 +750,9 @@ lands. One VLM-scale caveat: per-image identification stays strong
 at the limit, but aggregate counting drifts (a 32-image batch was
 counted as 30).
 
-## Speculative decode: tested and rejected, finally
+## Speculative decode: tested and rejected (final)
 
-DSpark speculative decoding was tested across **six boots** covering
+DSpark (the fork's built-in speculative drafter) was tested across **six boots** covering
 every knob-accessible configuration, and the rejection is final — but
 the mechanism is not the one the first capacity reading suggested, and
 the distinction matters for anyone re-trying it:
@@ -819,7 +875,8 @@ two cannot be read as a delta.
 | [#62183](https://github.com/vllm-project/vllm/pull/62183) / [#62384](https://github.com/vllm-project/vllm/pull/62384) APC + SWA bounded replay under PCP | Oct 19 / 23 | no | prefix cache + SWA geometry, but PCP is a datacenter shape |
 
 The table above is a selection, not the whole delta: roughly twenty pull
-requests moved after the pin, and the eight marked `no` are the ones worth
+requests moved after the pin, and the seven rows (eight pull requests)
+marked `no` are the ones worth
 watching. The only correctness-class work among them is the
 batch-invariance series — three pull requests, all still open. Everything
 else is performance or plumbing.
@@ -852,9 +909,22 @@ re-audit rather than an upgrade.
 - The MiaAI-Lab recipe for the SGLang comparison numbers and the NCCL
   buffer tuning discovery (their documentation of the 4.7 GiB → 139 MiB
   fix was the key that unlocked the head node)
-- The upstream vLLM `safetensors` loader path, which avoids the
-  pinned-bounce-buffer OOM the b12x loader hits on a busy head node
+- The christopherowen/dgx-spark-networking project for the optional
+  one-shot transport's wiring (Apache-2.0; `launch/tp3-kit/sparknet/`)
+- The upstream vLLM `safetensors` loader path, kept here as the
+  conservative weight-loading fallback (wall 3)
+
+## Changelog
+
+- **2026-11** — decode-under-prefill share 0.2 shipped (FIXLOG failure
+  mode 16); the 2026-11 kernel stack (~35 tok/s single-stream); the
+  capacity overlay + 5 GB KV at 1M context; the b12x loader as the
+  shipped default; the optional one-shot transport kit.
+- **2026-10** — first publication: the TP3 bring-up, the six walls, and
+  the acceptance-gate suite.
 
 ## License
 
-MIT
+MIT for the files original to this repository. The files under
+`launch/tp3-kit/overlay/` are modified copies of Apache-2.0 vLLM
+sources and remain Apache-2.0; the MIT grant does not cover them.
