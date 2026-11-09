@@ -21,6 +21,9 @@ The kit is staged to the boxes by `ds41-flash-tp3-up stage-env`; it is
 also in the recipe checkout under `launch/tp3-kit/`, which is the copy
 to read but not the copy to run against a remote container.
 
+Tool prerequisites: `jq` for gates 2–5, and Python 3 with Pillow
+(`pip install pillow`) for gate 10.
+
 ## 1. Health
 
 ```sh
@@ -146,37 +149,14 @@ manifest expects.
 
 ### The all-reduce expectation
 
-One expectation is about the transport rather than a kernel, and it needs
-a word of its own because it is the one that a **physical** change can
-break.
-
-The launcher sets `VLLM_ENABLE_ROCE_ALLREDUCE=1`, and the image ships a
-one-shot RoCE collective (`B12X_ROCENANTE`) that needs both RoCE rails of
-a link to reach the peer. The topology this recipe ships has one cable
-per **pair of boxes** — three cables, each device connected to the other
-two, and both of each device's ports in use — so that collective cannot
-form: the engine logs the failure and engages `PYNCCL` instead. With the
-optional sparknet layer armed, the expectation is per-group instead
-(`tp:0` = `SPARKNET_ONESHOT,PYNCCL`, `ep:0` = `PYNCCL` — see
-`tp3-kit/sparknet/README.md`). The gate
-asserts the transport that **actually engaged**, on every group the
-engine reports, against `resolved_backends.expect.allreduce_backend` in
-the manifest.
-
-On the shipped topology the expected value is `PYNCCL`, and the published
-figures were all measured on that path. There is nothing to re-cable:
-engaging the collective would need a second cable between the same pair
-of boxes, which NVIDIA's own
-[cluster guidance](https://docs.nvidia.com/sync/0.97.6/cluster-assistant.html)
-says "will not improve performance".
-
-If the transport ever changes, this gate will **fail**, and it is meant
-to: the expectation now describes a lane that no longer exists. Read the
-transport out of the engine's dispatch line and update
-`launch/tp3-kit/engine-identity.json`
-(`resolved_backends.expect.allreduce_backend`) to match, and the gate
-then asserts the new transport. The failure message prints the engine's
-own diagnostic so the reason is in front of you rather than inferred.
+The gate asserts the transport that **actually engaged**, on every group
+the engine reports, against `resolved_backends.expect.allreduce_backend`
+in the manifest. On the shipped one-cable-per-pair triangle the expected
+value is `PYNCCL`; with the optional sparknet layer armed it is
+per-group instead (see `tp3-kit/sparknet/README.md`). Why the one-shot
+collective cannot form on this fabric, and what to do when a fabric
+change flips this gate, is in the README section **The one-shot RoCE
+all-reduce is not engaged on this fabric**.
 
 Every expectation is read from the engine's own startup log, its own
 `/metrics` and its own resolved config — and the one expectation that is
@@ -222,11 +202,6 @@ actually produces rather than left as a guess.
 It sends an 8k-token prefill three times. Run it against a lane you are
 accepting, not against one carrying production traffic.
 
-## Pass criteria
-
-All gates must pass. A failed gate is diagnosed forward from the
-FIXLOG, never rolled back automatically.
-
 ## 10. Vision round-trip (requires LIMIT_MM > 0)
 
 Send a generated image with known content and require specific recovery:
@@ -246,3 +221,8 @@ curl -s http://HEAD_IP:8600/v1/chat/completions \
 # expected: the description names a yellow triangle (apex up) and a red
 # rectangle (lower right) on a blue background
 ```
+
+## Pass criteria
+
+All gates must pass. A failed gate is diagnosed forward from the
+FIXLOG, never rolled back automatically.

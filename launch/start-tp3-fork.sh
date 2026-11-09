@@ -28,8 +28,9 @@
 # drops from tens of seconds to single-digit seconds, at no measurable
 # long-prefill cost), a static decode-under-prefill share of 0.2 plus a
 # 2048/step contended-prefill cap (a short request DECODING beside that
-# same prefill: ~1.4 -> ~25 tok/s; the price is ~+1 s on that first-token
-# time; the measured ladder sits on the PREFILL_COMPUTE_SHARE comment),
+# same prefill: ~1.4 -> ~25 tok/s; the first-token price is ~5-6 s versus
+# ~4.6-4.8 s at higher shares; the measured ladder sits on the
+# PREFILL_COMPUTE_SHARE comment),
 # b12x kernel autotune OFF (heuristic plans ship as prebuilt
 # cubins; boots in roughly half the tuned time, decode parity, a few
 # percent slower one-time cold prefill), speculative decoding OFF --
@@ -124,7 +125,7 @@ PREFILL_POLICY="${PREFILL_POLICY:-decode-aware}"
 # container's ENV still carries an empty PREFILL_COMPUTE_SHARE.
 PREFILL_COMPUTE_SHARE="${PREFILL_COMPUTE_SHARE-0.2}"
 PREFILL_TOKENS_PER_STEP="${PREFILL_TOKENS_PER_STEP:-2048}"
-# Row 13 (KEEP, 2026-11): the b12x loader routes checkpoint views through an
+# The b12x loader (KEEP, 2026-11): routes checkpoint views through an
 # asynchronous read ring (O_DIRECT bounce buffers on GB10 - read_mode=auto
 # resolves to "bounce" because capabilities(0).host_page_tables == 1), and cut
 # the model-load phase ~190 s -> ~32 s. Override with LOAD_FORMAT=safetensors
@@ -435,7 +436,7 @@ fi
 #
 # 0.3 then moved it and the whole trade was measured pairwise:
 # decode-under-prefill ~15.4 -> ~22.3 tok/s (+~45 %), short-request TTFT
-# ~4.6 -> ~4.7 s (+~3 %), idle decode unchanged (~36), the deep prefill's
+# ~4.6 -> ~4.7 s (+~3 %), idle decode unchanged (~35-36), the deep prefill's
 # wall FLAT (~87 -> ~86 s — the anticipated +27-31 % price did not
 # appear), MemFree ~2 GB, 0 preemptions, and no capability change (a
 # 14-point capability check passed unchanged).
@@ -448,7 +449,7 @@ fi
 # effect at +~13 %), the prefill's charged contended seconds/pair ~7.5 ->
 # ~6.2 and the split ~51 % -> ~46 % (the mechanism: less contended time
 # charged to the prefill), the deep prefill's wall FLAT (~86 s in every
-# arm), idle decode unchanged (~36), MemFree ~1.7-1.8 GB, 0 preemptions,
+# arm), idle decode unchanged (~35-36), MemFree ~1.7-1.8 GB, 0 preemptions,
 # and no capability change (the same 14-point check, passed). Those
 # measurements could only BOUND the short-request TTFT price (point
 # ~+0.4 s, ~+8 %; bounded at <= +25 % -- the ceiling the trade was
