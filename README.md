@@ -476,8 +476,8 @@ NCCL_PROTO="^LL128"
 NCCL_MAX_NCHANNELS=8
 
 # Allocator
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False   # NaN claim did not reproduce
-                                                    # (2026-11); True+GC0.6 buys ~1.9 GB
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.6
+                                                    # adopted 2026-11: ~1.9 GB headroom
                                                     # (see FIXLOG row 8)
 # the launcher also forwards MALLOC_ARENA_MAX=2 to the engine
 # (see "Where the boot time goes")
