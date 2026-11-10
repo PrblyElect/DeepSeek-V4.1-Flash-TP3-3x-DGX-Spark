@@ -807,8 +807,14 @@ change above (True + GC 0.6), a **3.0 GiB KV pool with DSpark k=3**
 boots, survives a ~350K deep prefill with no OOM and no memory-pressure
 movement, and reads **~2.7× at 1M context** with solo decode rates of
 ~49-58 tok/s across workload classes — the first middle profile that
-survives the deep workload. It sits between the two poles: more pool
-than the 2× profile, more speed than the 5 GiB profile. The capture-size
+survives the deep workload. **Its concurrency limits are now measured:**
+at 4 concurrent streams it reads ~131 tok/s aggregate (the strongest
+concurrent spec number on any profile), but at 8 streams it drops to
+~96 (the MoE grouped path dominates at that batch width). A 2×1M
+concurrent deep prefill **completes** on this profile (the prior OOM
+kill is gone under the adopted allocator) but at a ~1.5 GB trough —
+thinner than this recipe's conservative floor. It is a strong
+low-concurrency option, not a center profile. The capture-size
 ladder for CUDA graphs at this pool was not tested (a memory-precondition
 gate stopped the boot honestly); a deployment needing graph capture at
 3.0 GiB should measure the capture cost before relying on it. Reopening at full capacity requires more
