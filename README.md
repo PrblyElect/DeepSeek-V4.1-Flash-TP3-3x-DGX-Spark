@@ -476,8 +476,9 @@ NCCL_PROTO="^LL128"
 NCCL_MAX_NCHANNELS=8
 
 # Allocator
-PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False   # mandatory: :True → NaN logits
-                                                     # on >64-token prompts (FIXLOG 8)
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False   # NaN claim did not reproduce
+                                                    # (2026-11); True+GC0.6 buys ~1.9 GB
+                                                    # (see FIXLOG row 8)
 # the launcher also forwards MALLOC_ARENA_MAX=2 to the engine
 # (see "Where the boot time goes")
 
@@ -799,7 +800,18 @@ recipe exists for. Re-verified on the shipped 2026-11 stack
 So the trade is exactly: **~2× single-stream for half the pool.** For
 this recipe's capacity-first mission the answer stays no; a
 throughput-shaped deployment with shallower contexts could take it
-tomorrow on these numbers. Reopening at full capacity requires more
+tomorrow on these numbers.
+
+**A middle option now exists (measured 2026-11):** with the allocator
+change above (True + GC 0.6), a **3.0 GiB KV pool with DSpark k=3**
+boots, survives a ~350K deep prefill with no OOM and no memory-pressure
+movement, and reads **~2.7× at 1M context** with solo decode rates of
+~49-58 tok/s across workload classes — the first middle profile that
+survives the deep workload. It sits between the two poles: more pool
+than the 2× profile, more speed than the 5 GiB profile. The capture-size
+ladder for CUDA graphs at this pool was not tested (a memory-precondition
+gate stopped the boot honestly); a deployment needing graph capture at
+3.0 GiB should measure the capture cost before relying on it. Reopening at full capacity requires more
 memory per rank (a 64 KiB-page kernel, the display carve-out) or a
 smaller *trained* drafter — engine/OS projects, not flags. The
 zero-weight alternative (n-gram prompting off the request's own tokens)
