@@ -18,8 +18,7 @@ DGX Sparks on a 200G CX-7 RoCE triangle, using the eugr b12x vLLM fork
 on a public Docker Hub image. Capacity-optimized: a **5 GB (4.7 GiB) KV
 reservation** at **1M context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
-block count (roughly 5.1M tokens at 1M with the capacity overlay — one full
-1M request fits by pool arithmetic; admission is verified to ~900K). **~35 tok/s single-stream** (prose,
+block count (roughly 5.1M tokens at 1M with the capacity overlay — the **full pool is simultaneously usable**: verified by filling 99.9999% of it with eight concurrent deep-context requests, all completing with no OOM). **~35 tok/s single-stream** (prose,
 no spec decode — the LM-head kernel, L2 set-aside and loader below are all
 part of the shipped posture), a cold boot loads the weights in **~32 s**
 (b12x O_DIRECT loader). A short request's first token lands in
