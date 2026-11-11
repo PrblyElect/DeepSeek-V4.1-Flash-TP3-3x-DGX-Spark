@@ -784,11 +784,13 @@ memory floor — it cannot carry the deep-concurrent RAG workload this
 recipe exists for. Re-verified on the shipped 2026-11 stack
 (LM-head kernel, L2 set-aside, decode-under-prefill share 0.2):
 
-- single-stream aggregate **~70 tok/s** on counting-task prompts —
-  **about 2× the plain lane's single-stream** — prose **~47**, with
-  ~4.7 s first-token beside a ~350K prefill (better than the plain
-  lane: the drafter's parallel drafts shorten the short request's own
-  decode)
+- single-stream aggregate **~74 tok/s** on counting-task prompts —
+  **about 2× the plain lane's single-stream** — code-class **~68**, at
+  the deepest tested draft depth (k=5); count and code trade down with
+  shallower depths (k=1 reads ~47/~48) because the per-step draft cost
+  **grows with depth, sub-linearly** — a saturating slope, not a flat
+  constant (measured directly at three depths) — while **prose is
+  depth-flat** (its best point is the middle depth, within noise)
 - aggregate **~140 tok/s at 8 streams**, and the sweep is **not
   monotone**: the 2-stream point dips below 1-stream (the MoE grouped
   path at 12 routed rows — the same regime the union-routing knob
