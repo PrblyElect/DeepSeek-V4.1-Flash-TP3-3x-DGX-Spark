@@ -18,7 +18,7 @@ DGX Sparks on a 200G CX-7 RoCE triangle, using the eugr b12x vLLM fork
 on a public Docker Hub image. Capacity-optimized: a **5 GB (4.7 GiB) KV
 reservation** at **1M context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
-block count (roughly 5.1M tokens at 1M with the capacity overlay — the **full pool is simultaneously usable**: verified by filling 99.9999% of it with eight concurrent ~640K-token requests and, separately, five concurrent ~1M requests, all completing with no OOM). **~35 tok/s single-stream** (prose,
+block count (roughly 5.1M tokens at 1M with the capacity overlay — the **full pool is simultaneously usable**: verified by filling 99.9999% of it with eight concurrent ~640K-token requests and, separately, five concurrent ~1M requests, all completing with no OOM and with free memory staying **above the conservative safety floor** throughout). **~35 tok/s single-stream** (prose,
 no spec decode — the LM-head kernel, L2 set-aside and loader below are all
 part of the shipped posture), a cold boot loads the weights in **~32 s**
 (b12x O_DIRECT loader). A short request's first token lands in
@@ -188,7 +188,7 @@ kernel autotune off, no spec decode, engram on NVMe):
 | Aggregate decode (counting-task prompts, idle lane) | 1× **~34** · 2× **~53** · 4× **~70** · 8× **~103** tok/s (per-stream at 8×: ~12-19 wall-based; the engine step time saturates around 45 ms from 4× up — the MoE grouped path carries the batch) |
 | Weights per rank | 95.4 GiB |
 | KV reservation | **5 GB (4.7 GiB)** (fixed by `--kv-cache-memory-bytes`; with the capacity overlay the pool reads ~5.1M at both contexts) |
-| Context length | **1,048,576 (1M)** — verified by the concurrent admission and prefill of up to five full-1M-class contexts (~3.4K tok/s aggregate on the deep fills; free-memory troughs ~1.5–2.1 GB) |
+| Context length | **1,048,576 (1M)** — verified by the concurrent admission and prefill of up to five full-1M-class contexts (~3.4K tok/s aggregate on the deep fills; the full-pool fill's free-memory trough sits **~2 GB, above the conservative floor**, on a current OS/driver baseline) |
 | Concurrency at 1M ctx | **~4.9×** — pool depth, not simultaneous streams; up to five ~1M requests verified live at once, and the entire pool fills end to end (`MAX_NUM_SEQS=8` caps live sequences; see the note under Configuration) |
 | Concurrency at 512K ctx | **~9.7×** — pool depth, as above |
 | Cold boot (load→health) | a few minutes (weight load ~32 s with the b12x loader, ~190 s on the safetensors fallback; the first boot pays kernel compilation, later boots save ~60 s via the persistent cache) |
