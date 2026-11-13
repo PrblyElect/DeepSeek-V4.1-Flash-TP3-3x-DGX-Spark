@@ -10,13 +10,14 @@ tags:
 - long-context
 ---
 
-# DeepSeek-V4.1-Flash at TP=3 across 3× NVIDIA DGX Spark — capacity-first
+# DeepSeek-V4.1-Flash at TP=3 across 3× NVIDIA DGX Spark, at 1M context
 
 **TL;DR** — Serve DeepSeek-V4.1-Flash (552B total, native FP4+FP8 MoE
 with a 196B engram conditional-memory block) tensor-parallel across three
 DGX Sparks on a 200G CX-7 RoCE triangle, using the eugr b12x vLLM fork
-on a public Docker Hub image. Capacity-optimized: a **5 GB (4.7 GiB) KV
-reservation** at **1M context** — the reservation is fixed by a pin, and
+on a public Docker Hub image. It ships two profiles. The default
+**capacity profile**: a **5 GB (4.7 GiB) KV reservation** at **1M
+context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
 block count (roughly 5.1M tokens at 1M with the capacity overlay — the **full pool is simultaneously usable**: verified by filling 99.9999% of it with eight concurrent ~640K-token requests and, separately, five concurrent ~1M requests, all completing with no OOM and with free memory staying **above the conservative safety floor** throughout). **~35 tok/s single-stream** (prose,
 no spec decode — the LM-head kernel, L2 set-aside and loader below are all
@@ -274,7 +275,7 @@ node-map template, the fenced-NCCL build recipe, and the GID-index trap that
 the first boot found the hard way. Off by default; the launcher refuses a
 half-armed boot. See `launch/tp3-kit/sparknet/README.md`.
 
-## Why capacity over speed
+## Why the capacity profile is the default
 
 The community SGLang recipe for this model on the same hardware
 achieves ~51 tok/s but with a 750K KV pool and 262K context. This
@@ -799,7 +800,7 @@ recipe exists for. Re-verified on the shipped 2026-11 stack
   (~15 tok/s decoding beside a deep prefill, against ~70 solo)
 
 So the trade was exactly: **~2× single-stream for half the pool.** For
-this recipe's capacity-first mission that answer stood — until the
+the capacity profile's mission that answer stood — until the
 8-stream ceiling itself was re-attributed (below).
 
 **A middle option now exists (measured 2026-11):** with the allocator
