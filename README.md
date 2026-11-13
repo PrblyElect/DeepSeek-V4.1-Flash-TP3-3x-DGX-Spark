@@ -19,7 +19,7 @@ on a public Docker Hub image. It ships two profiles. The default
 **capacity profile**: a **5 GB (4.7 GiB) KV reservation** at **1M
 context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
-block count (roughly 5.1M tokens at 1M with the capacity overlay — the **full pool is simultaneously usable**: verified by filling 99.9999% of it with eight concurrent ~640K-token requests and, separately, five concurrent ~1M requests, all completing with no OOM and with free memory staying **above the conservative safety floor** throughout). **~35 tok/s single-stream** (prose,
+block count (roughly 5.1M tokens at 1M with the capacity overlay — the **full pool is simultaneously usable**: verified by filling 99.9999% of it with eight concurrent ~640K-token requests and, separately, five concurrent ~1M requests, all completing with no OOM and with free memory staying **above the conservative safety floor** throughout; one step larger was measured too — a 6 GiB reservation's whole ~6.2M-token pool also fills end to end, but its trough dips below that floor, so **5 GiB is the measured capacity ceiling on this stack**). **~35 tok/s single-stream** (prose,
 no spec decode — the LM-head kernel, L2 set-aside and loader below are all
 part of the shipped posture), a cold boot loads the weights in **~32 s**
 (b12x O_DIRECT loader). A short request's first token lands in
@@ -288,7 +288,11 @@ long legal or research documents, multi-turn conversations with massive
 history), the KV pool and context length are the binding constraints,
 not generation speed. A 300K-token document is rejected outright at a
 262K context; a ~16 tok/s difference in generation speed is invisible when
-streaming at reading speed.
+streaming at reading speed. The 5 GiB reservation is also the **measured
+ceiling**, not a conservative pick: past this envelope the deep-fill
+trough pins near ~1.5 GB — the 6 GiB reservation's whole-pool fill lands
+there and dips under the safety floor, where the 5 GiB fill clears it at
+~2 GB (FIXLOG 20).
 
 The trade-off table:
 
@@ -840,20 +844,39 @@ and 4-stream at its best measured point (~160)**. The mechanism: with two
 parallel prefills the engine interleaves prefill chunks into decode
 steps, and the speculative decode path pays for the mixing; one serialized
 prefill keeps decode batches pure. The capacity side improves too: the
-2×1M concurrent deep-prefill trough on the ~2.3M-token spec pool rises
-**above the recipe's conservative floor (~1.9 GB)** where the
-parallel-prefill form sat roughly a third of a GB lower — and the aggregate 2×1M wall is
-unchanged (only the second stream's time-to-first-token serializes). The
+concurrent deep-prefill trough — two ~512K prefills, ~1M tokens of the
+~2.3M-token spec pool — rises **above the recipe's conservative floor
+(~1.9 GB)** where the parallel-prefill form sat roughly a third of a GB
+lower, at an unchanged aggregate wall (only the second stream's
+time-to-first-token serializes). *(Label corrected against the measured
+fills: that fill is ~1M tokens, not 2×1M as previously written.)* Filling the
+tier's **whole** pool — three ~765K prefills, >99.9% of it — completes
+end to end with no OOM, but its trough dips just under the floor
+(~1.5 GB): the tier's verified-clean concurrent deep fill is ~1M tokens,
+and the ~2.2× pool-depth figure is arithmetic, not a fill claim. The
 two levers do not compose: per-batch depths + one serialized prefill
 reaches the high-200s at 8 streams but the deep-prefill trough drops back
 under the floor, so the shipped spec tier uses the plain k=5 drafter with
 one serialized prefill.
 
+**Raising the tier's sequence cap extends the same curve (measured on
+this stack).** With `MAX_NUM_SEQS=16` the tier reads **~305–325 tok/s
+aggregate at 16 streams** — roughly 3× the plain lane's 8-stream band —
+with single-stream unchanged, draft acceptance flat, zero preemptions,
+and the default CUDA-graph capture ladder already covering the 16-stream
+verify shapes on this build (the captured-size list includes the 96-row
+verify shape; the smaller rungs read inside their published bands on the
+same boot). That is interactive concurrency, not deep capacity: sixteen
+short streams occupy a fraction of the pool, and the fill limits above
+are unchanged.
+
 **The shipped posture is two tiers**: the capacity profile above (no spec,
 ~5.1M tokens, the deep-concurrent RAG mission) and an optional serving
-tier — **KV ~2.5 GiB, DSpark k=5, `PAR_PREFILLS=1`** — for interactive
-latency (~2× single-stream, ~2× 8-stream) at ~2.3M tokens (~2.2× at 1M
-context). Switch by profile, not by compromise. One more measured caution:
+tier — **KV ~2.5 GiB, DSpark k=5, `PAR_PREFILLS=1`, `MAX_NUM_SEQS=16`** —
+for interactive latency (~2× single-stream, ~2× 8-stream, **~305–325
+tok/s at 16 streams**) at a ~2.3M-token pool (~2.2× at 1M context by pool
+arithmetic; the verified-clean concurrent deep fill is ~1M tokens — see
+the note above). Switch by profile, not by compromise. One more measured caution:
 the adaptive verifier's workspace is *elastic* — it absorbs whatever the
 KV reservation gives up, leaving idle free memory pinned near ~1.5 GB at
 every pool size tried — so it is a burst-only option on this hardware,
