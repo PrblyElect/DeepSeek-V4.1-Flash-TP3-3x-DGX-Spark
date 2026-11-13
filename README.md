@@ -541,7 +541,7 @@ pass. On this configuration the engine resolves:
 | dense linear | `FlashInferCutlassMxfp8LinearKernel` |
 | attention | b12x (DSA indexer) |
 | TP=3 head padding | 64 heads → 72, in 9 output groups |
-| speculative decode | off |
+| speculative decode | off on the capacity profile; DSpark k=5 + one serialized prefill on the optional serving tier (see the spec section) |
 | load format | `b12x` |
 | all-reduce transport | `PYNCCL` (see **The one-shot RoCE all-reduce is not engaged on this fabric**) |
 
@@ -751,7 +751,7 @@ lands. One VLM-scale caveat: per-image identification stays strong
 at the limit, but aggregate counting drifts (a 32-image batch was
 counted as 30).
 
-## Speculative decode: tested and rejected (final)
+## Speculative decode: rejected as the center profile, adopted as a serving tier
 
 DSpark (the fork's built-in speculative drafter) was tested across **six boots** covering
 every knob-accessible configuration, and the rejection is final — but
@@ -798,10 +798,9 @@ recipe exists for. Re-verified on the shipped 2026-11 stack
 - the shipped decode-under-prefill share carries into spec
   (~15 tok/s decoding beside a deep prefill, against ~70 solo)
 
-So the trade is exactly: **~2× single-stream for half the pool.** For
-this recipe's capacity-first mission the answer stays no; a
-throughput-shaped deployment with shallower contexts could take it
-tomorrow on these numbers.
+So the trade was exactly: **~2× single-stream for half the pool.** For
+this recipe's capacity-first mission that answer stood — until the
+8-stream ceiling itself was re-attributed (below).
 
 **A middle option now exists (measured 2026-11):** with the allocator
 change above (True + GC 0.6), a **3.0 GiB KV pool with DSpark k=3**
@@ -826,6 +825,38 @@ smaller *trained* drafter — engine/OS projects, not flags. The
 zero-weight alternative (n-gram prompting off the request's own tokens)
 is untested here and is the only spec-adjacent direction that does not
 carry the drafter's residency.
+
+**The 8-stream ceiling was the scheduler, not the drafter (measured on the
+same stack).** Every kernel-side lever tried — an adaptive verifier, a
+per-batch-size draft-depth schedule (the engine accepts
+`num_speculative_tokens_per_batch_size`; its CUDA-graph capture ladder
+visibly grows the new depths, so honoring is verifiable in the boot log) —
+moved 8-stream aggregate only from ~140 to ~145 tok/s. Setting
+**`PAR_PREFILLS=1`** (serialize deep prefills; the decode-under-prefill
+share stays) moves it to **~225 tok/s aggregate at 8 streams — roughly
+2× the plain lane's 8-stream band — with single-stream unchanged (~74)
+and 4-stream at its best measured point (~160)**. The mechanism: with two
+parallel prefills the engine interleaves prefill chunks into decode
+steps, and the speculative decode path pays for the mixing; one serialized
+prefill keeps decode batches pure. The capacity side improves too: the
+2×1M concurrent deep-prefill trough on the ~2.3M-token spec pool rises
+**above the recipe's conservative floor (~1.9 GB)** where the
+parallel-prefill form sat roughly a third of a GB lower — and the aggregate 2×1M wall is
+unchanged (only the second stream's time-to-first-token serializes). The
+two levers do not compose: per-batch depths + one serialized prefill
+reaches the high-200s at 8 streams but the deep-prefill trough drops back
+under the floor, so the shipped spec tier uses the plain k=5 drafter with
+one serialized prefill.
+
+**The shipped posture is two tiers**: the capacity profile above (no spec,
+~5.1M tokens, the deep-concurrent RAG mission) and an optional serving
+tier — **KV ~2.5 GiB, DSpark k=5, `PAR_PREFILLS=1`** — for interactive
+latency (~2× single-stream, ~2× 8-stream) at ~2.3M tokens (~2.2× at 1M
+context). Switch by profile, not by compromise. One more measured caution:
+the adaptive verifier's workspace is *elastic* — it absorbs whatever the
+KV reservation gives up, leaving idle free memory pinned near ~1.5 GB at
+every pool size tried — so it is a burst-only option on this hardware,
+not a standing profile.
 
 ## Comparison with other V4.1-Flash recipes
 
