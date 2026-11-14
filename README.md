@@ -729,6 +729,18 @@ is no further work to do here. If a smaller checkpoint is ever wanted, an
 FP8 subset or a lower-bit-width variant, that is a checkpoint question and
 it would change the arithmetic; it is not a prefetch question.
 
+One cost of disk tables is addressable by an overlay: each step's disk
+read is preceded by a blocking event sync that proves the GPU-hashed row
+ids have landed in the pinned staging buffer — measured at **~8% of
+worker wall-time** on this hardware class under concurrent decode, and it
+grows under memory pressure. The optional kit at
+**`patches/engram-host-hash/`** computes the same 24 per-token hash ids
+on the host and stages them straight into the pinned buffers, deleting
+that sync (the measured share drops to **~2%**); it is bit-identical to
+the engine's own reference oracle by construction and guarded by a
+per-boot self-check that permanently falls back to the native path on
+any mismatch.
+
 ## Vision: built in, one flag
 
 The 1017 checkpoint carries a 32-layer ViT tower, and the fork ships the
