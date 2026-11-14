@@ -852,7 +852,7 @@ time-to-first-token serializes). *(Label corrected against the measured
 fills: that fill is ~1M tokens, not 2×1M as previously written.)* Filling the
 tier's **whole** pool — three ~765K prefills, >99.9% of it — completes
 end to end with no OOM, but its trough dips just under the floor
-(~1.5 GB): the tier's verified-clean concurrent deep fill is ~1M tokens,
+(~1.5 GB — root-caused in FIXLOG 21 as the host kernel's `vm.min_free_kbytes` release clamp, not an engine allocation): the tier's verified-clean concurrent deep fill is ~1M tokens,
 and the ~2.2× pool-depth figure is arithmetic, not a fill claim. The
 two levers do not compose: per-batch depths + one serialized prefill
 reaches the high-200s at 8 streams but the deep-prefill trough drops back
@@ -872,11 +872,15 @@ are unchanged.
 
 **The shipped posture is two tiers**: the capacity profile above (no spec,
 ~5.1M tokens, the deep-concurrent RAG mission) and an optional serving
-tier — **KV ~2.5 GiB, DSpark k=5, `PAR_PREFILLS=1`, `MAX_NUM_SEQS=16`** —
-for interactive latency (~2× single-stream, ~2× 8-stream, **~305–325
+tier — **KV ~2.5 GiB, DSpark k=5, `PAR_PREFILLS=1`, `MAX_NUM_SEQS=16`,
+`--long-prefill-token-threshold 1024`** — for interactive latency
+(~2× single-stream, ~2× 8-stream, **~305–325
 tok/s at 16 streams**) at a ~2.3M-token pool (~2.2× at 1M context by pool
 arithmetic; the verified-clean concurrent deep fill is ~1M tokens — see
-the note above). Switch by profile, not by compromise. One more measured caution:
+the note above). The threshold flag is the tier's interactive-admission
+fix (FIXLOG 21): **a chat arriving beside any deep prefill gets its first
+token in ~1 second** (measured at 350K and 1M depths; without it the
+arrival waits the whole prefill). Switch by profile, not by compromise. One more measured caution:
 the adaptive verifier's workspace is *elastic* — it absorbs whatever the
 KV reservation gives up, leaving idle free memory pinned near ~1.5 GB at
 every pool size tried — so it is a burst-only option on this hardware,
