@@ -19,7 +19,7 @@ on a public Docker Hub image. It ships two profiles. The default
 **capacity profile**: a **5 GB (4.7 GiB) KV reservation** at **1M
 context** — the reservation is fixed by a pin, and
 the engine's token figure scales with the context value at the same
-block count (roughly 5.1M tokens at 1M with the capacity overlay — the **full pool is simultaneously usable**: verified by filling 99.9999% of it with eight concurrent ~640K-token requests and, separately, five concurrent ~1M requests, all completing with no OOM and with free memory staying **above the conservative safety floor** throughout; one step larger was measured too — a 6 GiB reservation's whole ~6.2M-token pool also fills end to end, but its trough dips below that floor, so **5 GiB is the measured capacity ceiling on this stack**). **~35 tok/s single-stream** (prose,
+block count (roughly 5.1M tokens at 1M with the capacity overlay — the **full pool is simultaneously usable**: verified by filling 99.9999% of it with eight concurrent ~640K-token requests and, separately, five concurrent ~1M requests, all completing with no OOM and with free memory staying **above the conservative safety floor** throughout; a 5.5 GiB step is receipted clean at trough ~2.1 GB / pool ~5.66M tokens (5.40×), and one step past that the 6 GiB reservation's whole ~6.2M-token pool fills end to end but troughs below the floor — **5 GiB ships as the default, 5.5 GiB is the receipted step, 6 GiB is the measured ceiling**). **~35 tok/s single-stream** (prose, with an optional interactive spec tier at ~2× that and ~1 s arrivals — see below;
 no spec decode — the LM-head kernel, L2 set-aside and loader below are all
 part of the shipped posture), a cold boot loads the weights in **~32 s**
 (b12x O_DIRECT loader). A short request's first token lands in
@@ -39,7 +39,7 @@ image family.)
 **Contents** — Quick start · Served numbers · The decode-step stack ·
 One-shot RoCE transport (optional) · Why capacity over speed · The
 bring-up: six walls · Troubleshooting · Stack · Configuration ·
-Re-audit triggers · Hardware · Engram on NVMe · Vision · Speculative
+Re-audit triggers · Hardware · Engram on NVMe (host-hash kit) · Vision · Speculative
 decode · Comparison · Upstream's own 3-node recipe · Credits · License
 
 **A published vLLM TP3 recipe for V4.1-Flash on a publicly available
@@ -813,7 +813,7 @@ recipe exists for. Re-verified on the shipped 2026-11 stack
   path at 12 routed rows — the same regime the union-routing knob
   prices)
 - the shipped decode-under-prefill share carries into spec
-  (~15 tok/s decoding beside a deep prefill, against ~70 solo)
+  (~30-40 tok/s decoding beside a deep prefill, against ~70 solo, worst gap under a second)
 
 So the trade was exactly: **~2× single-stream for half the pool.** For
 the capacity profile's mission that answer stood — until the
@@ -884,12 +884,14 @@ are unchanged.
 
 **The shipped posture is two tiers**: the capacity profile above (no spec,
 ~5.1M tokens, the deep-concurrent RAG mission) and an optional serving
-tier — **KV ~2.5 GiB, DSpark k=5, `PAR_PREFILLS=1`, `MAX_NUM_SEQS=16`,
+tier — **KV ~4.8 GiB, DSpark k=5, `PAR_PREFILLS=1`, `MAX_NUM_SEQS=8 or 16`,
 `--long-prefill-token-threshold 1024`** — for interactive latency
-(~2× single-stream, ~2× 8-stream, **~305–325
-tok/s at 16 streams**) at a ~2.3M-token pool (~2.2× at 1M context by pool
-arithmetic; the verified-clean concurrent deep fill is ~1M tokens — see
-the note above). The threshold flag is the tier's interactive-admission
+(~2× single-stream, ~2× 8-stream, **~305–346
+tok/s at 16 streams**, record speed) at a ~4.85M-token pool (~4.6× at
+1M context, whole-pool fill certified clean; the host-hash kit at
+`patches/engram-host-hash/` removes the per-step engram drain-sync —
+FIXLOG 22). The earlier 2.5 GiB form is the conservative variant
+(smaller pool, deep fill under the floor). The threshold flag is the tier's interactive-admission
 fix (FIXLOG 21): **a chat arriving beside any deep prefill gets its first
 token in ~1 second** (measured at 350K and 1M depths; without it the
 arrival waits the whole prefill). Switch by profile, not by compromise. One more measured caution:
