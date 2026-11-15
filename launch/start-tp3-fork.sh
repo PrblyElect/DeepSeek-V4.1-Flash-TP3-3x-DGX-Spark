@@ -214,7 +214,7 @@ MOE_BACKEND="${MOE_BACKEND:-b12x}"
 # Default 1: with no step cap set, the value is inert.
 VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS="${VLLM_SCHEDULER_UNCAP_PREFILL_ONLY_STEPS:-1}"
 B12X_AUTOTUNE="${B12X_AUTOTUNE:-0}"
-PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:False}"
+PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,garbage_collection_threshold:0.6}"
 KIT_DIR="$(cd "$(dirname "$0")/tp3-kit" && pwd)"
 
 [[ -d "$MODEL_DIR" ]] || { echo "model not staged: $MODEL_DIR" >&2; exit 1; }
@@ -710,6 +710,8 @@ run_args=(
   -e VLLM_ENABLE_PCIE_ALLREDUCE=0
   -e B12X_AUTOTUNE="$B12X_AUTOTUNE"
   -e B12X_W4A8_TINY_DECODE="$B12X_W4A8_TINY_DECODE"
+  -e DS41_ENGRAM_HOST_HASH="${DS41_ENGRAM_HOST_HASH:-}"
+  -e DS41_ENGRAM_HOST_HASH_STRICT="${DS41_ENGRAM_HOST_HASH_STRICT:-}"
   # the b12x dynamic kernel's work source (2026-11). "materialized_queue" is
   # the production default and is the value in force previously: it
   # takes DIRECT routing while routed_rows <= 32 (_impl.py:2259), i.e. one full
