@@ -208,7 +208,7 @@ DSpark k=5, one serialized prefill, the interactive-admission threshold,
 |---|---|
 | Single-stream decode (counting-task) | **~74 tok/s** — about 2× the no-spec lane; code-class ~68 (the LM-head kernel + L2 set-aside below carry both profiles) |
 | Aggregate decode (counting-task prompts, idle lane) | 1× **~74** · 4× ~160 · 8× **~225** · 16× **~305–346 tok/s** (record speed; zero preemptions and flat acceptance at 16 — the sweep is not monotone, the 2-stream point dips below 1-stream) |
-| Arrival TTFT beside any deep prefill | **~1 s** (measured at 350K and 1M depths; without the threshold the arrival waits the whole prefill) |
+| Arrival TTFT of a NEW short chat beside any deep prefill | **~1 s** (measured at 350K and 1M depths; without the threshold the arrival waits the whole prefill). Scope: a short new chat. A session resumed with a large cold context additionally pays its own prefill before first output — at the recipe's published prefill rates, roughly 20–30 s per 100K tokens of resumed context, more beside active traffic |
 | Decode beside a deep prefill | **~30–40 tok/s** per stream (against ~70 solo; worst gap under a second) |
 | KV reservation | **~4.8 GiB** (the `4.8g` pin; with the capacity overlay the pool reads ~4.85M at 1M) |
 | Concurrency at 1M ctx | **~4.6×** — pool depth; whole-pool fill certified clean (FIXLOG 22) |
@@ -313,14 +313,18 @@ that switches the small collectives to a per-peer-HCA-map one-shot transport
 measured at **~+5% single-stream and +12–15% two-stream aggregate** on this
 posture, with no memory cost: routing templates you edit for your fabric, a
 node-map template, the fenced-NCCL build recipe, and the GID-index trap that
-the first boot found the hard way. Off by default; the launcher refuses a
+the first boot found the hard way. Optional and off by default in the
+kit — but **every performance number in this README was measured on
+boots with this layer armed** (the kit's arming steps show how); on a
+stock `PYNCCL`-only boot expect roughly the deltas above subtracted
+(≈ −5 % single-stream, −12–15 % two-stream). The launcher refuses a
 half-armed boot. See `launch/tp3-kit/sparknet/README.md`.
 
 ## The two profiles
 
 The **serving profile is the default** because it is what interactive
 use needs: per-stream speed (~74 tok/s single-stream, about 2× the
-no-spec lane), arrivals that land in ~1 s beside any prefill, and
+no-spec lane), arrivals that land in ~1 s beside any prefill (short new chats; a session resumed with a large cold context pays its own prefill first), and
 headroom for many simultaneous chat streams (~305–346 tok/s at 16) —
 while still holding a ~4.85M-token pool at 1M context, where the
 community SGLang recipe for this model on the same hardware holds 750K
@@ -603,7 +607,7 @@ pass. On this configuration the engine resolves:
 | TP=3 head padding | 64 heads → 72, in 9 output groups |
 | speculative decode | DSpark k=5 + one serialized prefill (the default serving profile; off on the capacity alternative — see the spec section) |
 | load format | `b12x` |
-| all-reduce transport | `PYNCCL` (see **The one-shot RoCE all-reduce is not engaged on this fabric**) |
+| all-reduce transport | **`SPARKNET_ONESHOT` + `PYNCCL` with the optional layer armed (all numbers in this README); `PYNCCL` stock** (see the transport section) |
 
 Two of those are load-bearing and are checked, not assumed:
 
@@ -634,7 +638,7 @@ the engine itself prints in the same startup dump — read it off a real
 serving boot, never guess it — the same recorded-decision pattern the
 all-reduce expectation follows after a fabric change.
 
-### The one-shot RoCE all-reduce is not engaged on this fabric
+### The one-shot RoCE all-reduce on this fabric
 
 The launcher sets `VLLM_ENABLE_ROCE_ALLREDUCE=1` and
 `VLLM_ROCE_ALLREDUCE_MAX_SIZE=2MB`, matching upstream's own three-node
@@ -666,14 +670,25 @@ enabled subset is `['PYNCCL']` — though it *does* appear in the potential
 list. That is the whole mechanism: the engine tried the one-shot
 collective, the collective disqualified itself on its own connectivity
 check, and the reduction fell through to stock NCCL over the same fabric.
-It works, and every number published in this recipe was measured that
-way.
+It works, and a default boot of this kit (layer unset) runs exactly
+that way.
+
+Update: with the optional layer's per-peer-HCA maps, the one-shot
+collective DOES form on the one-cable triangle (the stock collective's
+two-rail demand is what cannot). Armed boots log
+`Using ['SPARKNET_ONESHOT', 'PYNCCL'] all-reduce backends … for group
+'tp:0'` — that line is the armed receipt. **Every performance number in
+this README was measured on boots that had the layer armed** (see the
+kit's arming steps); a stock boot runs the `PYNCCL` path above and lands
+roughly the deltas subtracted.
 
 None of this is visible from the recipe's command line: the knob is set,
 the collective is absent, and the fallback is silent. So the expectation
 now lives in the engine-identity manifest and gate 8 asserts it, reading
-the engine's own dispatch line for every group the engine reports. The
-**expected** value on this topology is `PYNCCL`.
+the engine's own dispatch line for every group the engine reports. On a
+**stock boot** (layer unset) the expected value is `PYNCCL`; armed
+boots expect `SPARKNET_ONESHOT, PYNCCL` — record which posture a given
+manifest describes.
 
 **If the transport ever changes**, gate 8 will **fail** — deliberately,
 because the manifest still describes the old one. Read the transport out
@@ -698,11 +713,12 @@ Engaging the collective would need a **second cable between the same pair
 of boxes**, and that is off NVIDIA's documented topology: their guidance
 says to use "only one cable per link" — a link being a pair of devices, or
 a device and its switch — and that "connecting two devices with two
-cables will not improve performance". So the collective is unreachable on
-the supported topology, the stock path is the supported one, and every
-number published in this recipe was measured on it. Engaging the one-shot
-collective would be a performance experiment against NVIDIA's own
-guidance — not a fix.
+cables will not improve performance". So the stock collective is unreachable on
+the supported topology — the stock path is the kit's default. The
+optional layer's per-peer-HCA maps sidestep that limit by design (one
+rail per mapped peer), which is why the measurements above were taken
+with it armed; a stock boot is the supported default and runs below the
+card by roughly the published deltas.
 
 ### Re-audit triggers
 
