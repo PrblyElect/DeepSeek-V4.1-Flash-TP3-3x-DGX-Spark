@@ -1,6 +1,8 @@
 # VALIDATION — ds41-flash-tp3
 
-Acceptance gates for the shipped configuration. Run after every boot.
+Acceptance gates for the shipped profiles (the serving profile is the
+default; the capacity alternative is documented in the README). Run
+after every boot.
 
 **Where each gate runs.** Gates 1–5, gate 9 and gate 10 are plain HTTP and run
 from anywhere that can reach the head box. Gates 6–8 shell out to the
@@ -90,18 +92,22 @@ time curl -s http://HEAD_IP:8600/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"main","messages":[{"role":"user","content":"Write a detailed paragraph about ocean currents."}],"max_tokens":250,"temperature":0}' | \
   jq '.usage.completion_tokens'
-# expected: 250 tokens in ~7 s (~35 tok/s with the shipped kernel stack;
-#           ~31 tok/s without the LM-head backend + L2 set-aside)
+# expected: 250 tokens in ~7 s on the capacity alternative (~35 tok/s
+#           with the shipped kernel stack; ~31 tok/s without the
+#           LM-head backend + L2 set-aside). The default serving profile
+#           (DSpark k=5) reads ~2x the no-spec lane on counting-class
+#           prompts; this gate's prompt is prose, so treat ~7 s as the
+#           no-spec reference point there, not a failure bound.
 ```
 
 ## 6. KV pool (from boot log)
 
 ```sh
 docker logs ds41-flash-tp3 2>&1 | grep "GPU KV cache size"
-# expected: ~5.1M tokens with the capacity overlay installed (quote the
-# block count -- ~21,945 at the shipped 5 GiB reservation -- as the
-# invariant), and a concurrency figure of roughly 4.9x at a 1,048,576-token
-# context
+# expected: ~4.85M tokens on the default serving profile (roughly 4.6x
+# at a 1,048,576-token context) or ~5.1M on the capacity alternative
+# (roughly 4.9x), with the capacity overlay installed; quote the block
+# count as the invariant (~21,945 at the 5 GiB capacity reservation)
 ```
 
 ## 7. Image identity
@@ -170,6 +176,16 @@ the gate unnoticed.
 
 Run it after the engine is up — the in-container identity gate runs
 *before* it, and cannot see this.
+
+**Posture-scoped expectation.** The manifest's `spec_decode` entry was
+pinned at `None` on the no-spec posture it was measured on. On the
+default serving profile the engine prints its `SpeculativeConfig` in
+the same startup dump — read that line off a real serving boot and
+update `resolved_backends.expect.spec_decode` in
+`launch/tp3-kit/engine-identity.json` to it (the check interpolates the
+expected value into a value-bearing log marker, so a guessed string
+fails). Switching profiles is a gated, recorded decision, like a fabric
+change.
 
 ## 9. Long-prompt determinism (crosses the chunked-prefill boundary)
 
