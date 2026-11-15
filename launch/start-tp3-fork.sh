@@ -117,7 +117,7 @@ LIMIT_MM="${LIMIT_MM:-{\"image\": 32}}"               # vision: images per promp
 # "1" restores legacy single-lane behavior. The policy requires
 # max-parallel-prefills > 1 (engine-side validation) and is only passed
 # when the count is above 1.
-PAR_PREFILLS="${PAR_PREFILLS:-2}"
+PAR_PREFILLS="${PAR_PREFILLS:-1}"
 PREFILL_POLICY="${PREFILL_POLICY:-decode-aware}"
 # Decode-under-prefill share — KEEP (measured 2026-11): 0.2 static + 2048/step cap;
 # see the bootstrap comment for the measured why. Empty ("") = legacy behavior:
@@ -158,7 +158,7 @@ SPEC_CFG="${SPEC_CFG:-}"
 # verification ran at a ~1.7 GB trough (floor 1.6). Drop to 4g if
 # in-service troughs breach the floor (one env; a 24h soak sampler
 # arbitrates).
-KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-5g}"
+KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-4.8g}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"

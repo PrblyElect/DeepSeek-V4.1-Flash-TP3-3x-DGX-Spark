@@ -1,6 +1,6 @@
 # engram-host-hash — delete the per-step engram disk-read drain-sync
 
-An optional engine overlay for this recipe's pinned image: it computes the
+Part of the shipped serving default (also usable standalone) for this recipe's pinned image: it computes the
 24 per-token engram hash ids on the **host** (CPU, numpy) from inputs that
 are already host-known, and stages them straight into the disk tables'
 pinned `ids_host` buffers — so the stock per-step GPU hash pipeline (the
