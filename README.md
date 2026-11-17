@@ -208,6 +208,7 @@ DSpark k=5, one serialized prefill, the interactive-admission threshold,
 |---|---|
 | Single-stream decode (counting-task) | **~74 tok/s** — about 2× the no-spec lane; code-class ~68 (the LM-head kernel + L2 set-aside below carry both profiles) |
 | Aggregate decode (counting-task prompts, idle lane) | 1× **~74** · 4× ~160 · 8× **~225** · 16× **~305–346 tok/s** (record speed; zero preemptions and flat acceptance at 16 — the sweep is not monotone, the 2-stream point dips below 1-stream) |
+| Deep-prefill wall (cold ~350K context, this hardware class) | high-80s of seconds at the shipped 2048 step; **roughly 10% faster with the optional 4096 layer** (both solo and beside traffic; short-prefill rates low-4K → mid-4K tok/s) |
 | Arrival TTFT of a NEW short chat beside any deep prefill | **~1 s** (measured at 350K and 1M depths; without the threshold the arrival waits the whole prefill). Scope: a short new chat. A session resumed with a large cold context additionally pays its own prefill before first output — at the recipe's published prefill rates, roughly 20–30 s per 100K tokens of resumed context, more beside active traffic |
 | Decode beside a deep prefill | **~30–40 tok/s** per stream (against ~70 solo; worst gap under a second) |
 | KV reservation | **~4.8 GiB** (the `4.8g` pin; with the capacity overlay the pool reads ~4.85M at 1M) |
@@ -607,6 +608,8 @@ pass. On this configuration the engine resolves:
 | TP=3 head padding | 64 heads → 72, in 9 output groups |
 | speculative decode | DSpark k=5 + one serialized prefill (the default serving profile; off on the capacity alternative — see the spec section) |
 | load format | `b12x` |
+| mHC prefill tile | optional — `patches/ds41mhc-tile/` (one-line tuning-default promotion; the vendor's own 4096-case geometry at every ≥2048-token plan) |
+| prefill step | 2048 tokens (shipped default); the optional 4096 layer in `config/cluster.env` reads roughly 10% faster deep prefills at an arrivals trade — and 4096 is the measured ceiling (FIXLOG 24–25) |
 | all-reduce transport | **`SPARKNET_ONESHOT` + `PYNCCL` with the optional layer armed (all numbers in this README); `PYNCCL` stock** (see the transport section) |
 
 Two of those are load-bearing and are checked, not assumed:
