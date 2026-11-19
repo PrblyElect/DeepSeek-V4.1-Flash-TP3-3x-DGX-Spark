@@ -142,7 +142,7 @@ DSpark k=5, one serialized prefill, the interactive-admission threshold,
 | Single-stream decode (counting-task) | **~74 tok/s** — about 2× the no-spec lane; code-class ~68 |
 | Aggregate decode (counting-task, idle lane) | 1× **~74** · 4× ~160 · 8× **~225** · 16× **~305–346 tok/s** (record speed; zero preemptions, flat acceptance at 16; the sweep is not monotone — the 2-stream point dips below 1-stream) |
 | Deep-prefill wall (cold ~350K, this hardware class) | high-80s of seconds at the shipped 2048 step; **~10% faster with the optional 4096 layer** (solo and beside traffic; short-prefill rates low-4K → mid-4K tok/s) |
-| Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see the next section; the paired 4096 layer held worst-moment available memory in a **~0.6–0.8 GiB band** on both a fresh boot and a memory-drained lane, all fills completing |
+| Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see the next section; the paired 4096 layer held worst-moment available memory in a **~0.6–0.8 GiB band** on both a fresh boot and a memory-drained lane, all fills completing — and the full pool-envelope fill (eight concurrent deep fills) completes end to end on the same layer |
 | Arrival TTFT of a NEW short chat beside any deep prefill | **~1 s** (measured at 350K and 1M depths; without the threshold the arrival waits the whole prefill). A session resumed with a large cold context additionally pays its own prefill first — roughly 20–30 s per 100K resumed tokens at the published rates |
 | Decode beside a deep prefill | **~30–40 tok/s** per stream (against ~70 solo; worst gap under a second) |
 | KV reservation / pool | **~4.8 GiB** → **~4.85M tokens (~4.6× at 1M)** with the overlay; whole-pool fill certified clean (FIXLOG 22) |
@@ -176,6 +176,17 @@ worst-moment available memory held a **~0.6–0.8 GiB band** on a fresh
 boot, and again — same band, same completion count, same aggregate rate —
 on a memory-drained lane immediately after. That is the shipped form of
 the layer (the three commented lines in `config/cluster.env`).
+
+The paired layer has since been pushed to the box's worst shapes: the
+full pool-envelope fill — eight concurrent deep fills, the sequence cap
+saturated — completed end to end with host available memory never
+approaching the kernel-OOM line (an envelope run rides a few hundred MiB
+for its duration; plan co-tenants accordingly); and a maximum-context
+single request ran with an interactive stream decoding beside it the
+whole time, holding sub-second worst gaps. Deep-fill walls at the 4096
+step pay the documented threshold class (+31–41 %), and long-context
+retrieval was re-verified at full depth on this geometry (3/3 at the
+context limit).
 
 Also budget-relevant: `MAX_NUM_BATCHED_TOKENS` is the knob whose
 **raising** has killed worker ranks outright — 16384 OOM-killed both
@@ -538,6 +549,13 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (hardening receipts)** — the paired 4096 layer proven to the
+  box's worst shapes: the full pool-envelope fill (eight concurrent deep
+  fills) end to end, a maximum-context request with interactive decode
+  beside it, retrieval re-verified at the context limit; and the
+  parallel-prefill/policy finding recorded (FIXLOG 28 — the policy pair
+  is inert at a count of 1, and PAR=2 trades the multi-stream aggregate
+  for decode-beside-prefill).
 - **2026-11 (single profile)** — the no-spec capacity alternative
   removed: its historical raison d'être (the drafter costing half the
   pool) closed when the serving profile reached ~4.85M tokens; its
