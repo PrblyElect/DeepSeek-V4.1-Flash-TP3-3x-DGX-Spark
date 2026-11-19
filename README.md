@@ -15,14 +15,16 @@ tags:
 **TL;DR** — Serve DeepSeek-V4.1-Flash (552B total, native FP4+FP8 MoE with a
 196B engram conditional-memory block) tensor-parallel across three DGX
 Sparks on a 200G RoCE triangle, on a public digest-pinned Docker image.
-The shipped **serving profile**: ~4.8 GiB KV at **1M context** (~4.85M-token
-pool, whole-pool fill certified), **DSpark k=5** speculative decode,
-**~74 tok/s single-stream (~2× the no-spec lane)**, ~225 tok/s at 8 streams,
-**~305–346 tok/s at 16**, and **~1 s first token for a chat arriving beside
-any deep prefill**. A cold boot loads weights in **~32 s**. The optional **4096-token deep-prefill layer** cuts deep-prefill
-walls ~10% and ships in a **memory-safe paired form** (FIXLOG 27): cap
+The shipped **serving profile**: ~4.8 GiB KV at **1M context** (~5.1M-token
+pool; the whole-pool envelope fill completes end to end), **DSpark k=5**
+speculative decode, the **paired 4096 deep-prefill layer**, and FP8
+attention internals — **~105 tok/s single-stream counting-class (prose
+~35–40)**, **~420 tok/s at 8 streams, ~470 at 16**, and **~1 s first token
+for a chat arriving beside any deep prefill** (carded 0.93–0.94 s). A cold
+boot loads weights in **~32 s**. Every figure is carded on the shipped
+configuration itself (FIXLOG 27 for the memory pairing: cap
 `MAX_NUM_BATCHED_TOKENS`, not the chunk, and the concurrent cold-prefill
-memory transient halves while the solo speed stays.
+transient halves while the solo speed stays).
 
 (b12x is the kernel lineage of these images — it prefixes their env vars,
 the MoE backend and the loader; "the b12x fork" below means this image
@@ -139,17 +141,17 @@ DSpark k=5, one serialized prefill, the interactive-admission threshold,
 
 | Metric | Value |
 |---|---|
-| Single-stream decode (counting-task) | **~74 tok/s** — about 2× the no-spec lane; code-class ~68 |
-| Aggregate decode (counting-task, idle lane) | 1× **~74** · 4× ~160 · 8× **~225** · 16× **~305–346 tok/s** (record speed; zero preemptions, flat acceptance at 16; the sweep is not monotone — the 2-stream point dips below 1-stream) |
-| Deep-prefill wall (cold ~350K, this hardware class) | high-80s of seconds at the shipped 2048 step; **~10% faster with the optional 4096 layer** (solo and beside traffic; short-prefill rates low-4K → mid-4K tok/s) |
+| Single-stream decode (counting-task) | **~105 tok/s** (prose-class ~35–40) — carded on the shipped stack |
+| Aggregate decode (counting-task, idle lane) | 1× **~105** · 4× **~270** · 8× **~420** · 16× **~470 tok/s** (prose-class spanning ~65–95 across the ladder; zero preemptions) |
+| Deep-prefill wall (cold ~350K, this hardware class) | **~110 s at the shipped 4096 layer** (the threshold-clipped admission price, +31–41 % over an unclipped fill — the documented trade for ~1 s arrivals); short-prefill rates mid-3K tok/s |
 | Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see the next section; the paired 4096 layer held worst-moment available memory in a **~0.6–0.8 GiB band** on both a fresh boot and a memory-drained lane, all fills completing — and the full pool-envelope fill (eight concurrent deep fills) completes end to end on the same layer |
-| Arrival TTFT of a NEW short chat beside any deep prefill | **~1 s** (measured at 350K and 1M depths; without the threshold the arrival waits the whole prefill). A session resumed with a large cold context additionally pays its own prefill first — roughly 20–30 s per 100K resumed tokens at the published rates |
-| Decode beside a deep prefill | **~30–40 tok/s** per stream (against ~70 solo; worst gap under a second) |
-| KV reservation / pool | **~4.8 GiB** → **~4.85M tokens (~4.6× at 1M)** with the overlay; whole-pool fill certified clean (FIXLOG 22) |
+| Arrival TTFT of a NEW short chat beside any deep prefill | **~1 s** (carded 0.93–0.94 s beside a 350K fill; without the threshold the arrival waits the whole prefill). A session resumed with a large cold context additionally pays its own prefill first — roughly 20–30 s per 100K resumed tokens at the published rates |
+| Decode beside a deep prefill | **~15–20 tok/s** per stream with **sub-half-second worst gaps** (carded beside a 400K fill; no stall class at the depths measured — sub-second worst gaps beside a maximum-context fill) |
+| KV reservation / pool | **~4.8 GiB** → **~5.1M tokens (~4.8× at 1M)** at the shipped 4096 step budget; whole-pool-envelope fill completes end to end |
 | Engram drain-sync | deleted by the host-hash kit: ~8% → **~2%** of worker wall-time |
 | Quality | clean across the acceptance gates (FIXLOG 21/22) |
 
-(Figures are single-boot point estimates; boot-to-boot variance ≈2%. The
+(Figures are single-boot point estimates; boot-to-boot variance a few percent. The
 **capacity overlay** is a two-file patch the bootstrap installs before the
 boot gate: stock KV accounting charges every request the worst-case span
 of all its sliding-window groups; the overlay charges each request its
@@ -168,14 +170,15 @@ cold prefills). Lowering the KV reservation does not touch it; on a
 loaded box, that transient is what reaches kernel-OOM territory (FIXLOG
 27).
 
-The fix composes with the optional 4096 layer: cap the budget to 4096 and
+The fix composes with the 4096 layer: cap the budget to 4096 and
 a lone request's chunk still fills the whole step — **the layer's solo
 speed is kept**, concurrent cold prefills share the smaller step, and the
 transient roughly halves. Measured with four concurrent ~350K cold fills:
 worst-moment available memory held a **~0.6–0.8 GiB band** on a fresh
 boot, and again — same band, same completion count, same aggregate rate —
 on a memory-drained lane immediately after. That is the shipped form of
-the layer (the three commented lines in `config/cluster.env`).
+the layer (the live block in `config/cluster.env`; the 2048 form is the
+commented conservative fallback).
 
 The paired layer has since been pushed to the box's worst shapes: the
 full pool-envelope fill — eight concurrent deep fills, the sequence cap
@@ -337,12 +340,12 @@ CTX=1048576
 SPEC_CFG='{"method":"dspark","num_speculative_tokens":5,"draft_tensor_parallel_size":3,"draft_sample_method":"greedy","rejection_sample_method":"block"}'
 PAR_PREFILLS=1                     # serialized prefills keep decode batches pure (FIXLOG 19)
 PREFILL_COMPUTE_SHARE=0.2          # decode-under-prefill share (FIXLOG 16)
-PREFILL_TOKENS_PER_STEP=2048       # the contended-prefill cap paired with it
+PREFILL_TOKENS_PER_STEP=4096       # the shipped deep-prefill layer (paired)
 EXTRA_SERVE_ARGS='--long-prefill-token-threshold 1024'   # ~1 s arrivals (FIXLOG 21)
 B12X_AUTOTUNE=0                    # heuristic cubin plans; see the decode-stack section
 
 MAX_NUM_SEQS=8                     # 16 extends the serving aggregate ladder
-MAX_NUM_BATCHED_TOKENS=8192        # the MEMORY lever of the prefill transient
+MAX_NUM_BATCHED_TOKENS=4096        # the step budget — the MEMORY lever
                                    # (this section's pairing note + FIXLOG 27);
                                    # do NOT raise — 16384 OOM-killed both workers
                                    # in the compile phase (FIXLOG 9)
@@ -363,8 +366,8 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.
 TOOL_CALL_PARSER=deepseek_v41; REASONING_PARSER=deepseek_v41
 ```
 
-The optional 4096 layer is a commented block in the same file — switch it
-whole. A historical no-spec capacity form (5 GB KV, parallel prefills)
+The 2048 conservative form is a commented block in the same file —
+switch blocks whole, never line by line. A historical no-spec capacity form (5 GB KV, parallel prefills)
 and its receipts are recorded in FIXLOG 20–22; on the current stack the
 serving profile's pool is within ~5% of it, so it is no longer shipped as
 a profile.
@@ -377,7 +380,7 @@ the requested value from the container's environment, the logged LCM, and
 the metric label.
 
 **Concurrency figures are pool depth**, not simultaneous streams:
-`MAX_NUM_SEQS` caps live sequences; the ~4.6× figure describes how
+`MAX_NUM_SEQS` caps live sequences; the ~4.8× figure describes how
 many full-length requests fit the pool.
 
 ## Re-audit triggers
@@ -477,10 +480,9 @@ it:
 - **The 8-stream ceiling was the scheduler, not the drafter**: with two
   parallel prefills the engine interleaves prefill chunks into decode
   steps and the spec path pays for the mixing — `PAR_PREFILLS=1` (one
-  serialized prefill) moves 8-stream aggregate from ~140 to ~225 tok/s,
-  single-stream unchanged. Raising `MAX_NUM_SEQS` to 16 extends the same
-  curve to ~305–346 tok/s with the default capture ladder already
-  covering the shapes.
+  serialized prefill) is what keeps the aggregate ladder at its carded
+  class (~420 at 8 streams, ~470 at 16 — the parallel form pays the
+  mixed-batch cudagraph cost, FIXLOG 28).
 - **The adaptive verifier is burst-only on this hardware**: its
   workspace is elastic and pins idle free memory near ~1.5 GB at every
   pool size tried. Kernel-side draft levers moved 8-stream only a few
@@ -500,7 +502,7 @@ differ). The landscape's shape, not a claim to a win:
 
 | Recipe | Engine | TP | Image | KV pool | Context |
 |---|---|---|---|---|---|
-| **This one** | vLLM (b12x fork), native weights | **3** | **public Docker Hub, digest-pinned** | **~4.85M** | **1M** |
+| **This one** | vLLM (b12x fork), native weights | **3** | **public Docker Hub, digest-pinned** | **~5.1M** | **1M** |
 | [MiaAI-Lab](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-DGX-Sparks) | SGLang | 3 (a 4-node line too) | SGLang base pinned by digest + local overlay | 750K (TP3) | 256K (TP3) |
 | [christopherowen/spark-ds41f](https://github.com/christopherowen/spark-ds41f) | vLLM (custom fork) | 3 or 4 | built from the repo | 1.3M–5.5M (TP3) – 11.6M (TP4) | 256K (TP3, 4k) / 1M (TP3, TP4) |
 | [tonyd2wild](https://github.com/tonyd2wild/DeepSeek-V4.1-Flash-TP2-and-TP4-DGX-Sparks) | TensorFold (a Zig engine); older vLLM lanes | 2 or 4 | built from source | 1.05M (TP2) – 29M positions | 300K – 1M |
@@ -522,7 +524,7 @@ differ:
 | `--kv-cache-memory-bytes` | `4.8g` | `0.5g` |
 | `--gpu-memory-utilization` | `0.85` | `0.87` |
 | `--max-num-seqs` | `8` (or `16` serving) | `2` |
-| `--max-num-batched-tokens` | `8192` (`4096` with the paired layer) | `4096` |
+| `--max-num-batched-tokens` | `4096` (shipped) | `4096` |
 | `--max-model-len` | `1048576` | `auto` |
 | speculative decode | dspark k=5 | dspark, 7 tokens |
 | `--load-format` | `b12x` | `b12x` |
@@ -549,6 +551,13 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.5.0 — the reconciliation + first true carding)** — the
+  best-found levers shipped: the paired 4096 layer promoted to the
+  shipped default and FP8 attention internals folded in (with the
+  launcher forward it had been missing); every published number re-carded
+  ON the shipped configuration (single-stream ~105 counting-class,
+  c16 ~470); two shipped-since-the-start defects found and fixed by the
+  carding boot itself (FIXLOG 29–30).
 - **2026-11 (hardening receipts)** — the paired 4096 layer proven to the
   box's worst shapes: the full pool-envelope fill (eight concurrent deep
   fills) end to end, a maximum-context request with interactive decode

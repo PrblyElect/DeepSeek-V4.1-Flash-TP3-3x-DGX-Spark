@@ -23,11 +23,11 @@
 #
 # SERVE LINE (the shipped profile in config/cluster.env): gmu 0.85,
 # kv-cache-memory-bytes 4.8g (with the capacity overlay the pool reads
-# ~4.85M tokens at 1M; quote BLOCKS as the invariant), ctx 1048576 (1M;
+# ~5.1M tokens at 1M; quote BLOCKS as the invariant), ctx 1048576 (1M;
 # the reservation pins the pool, not ctx), ONE serialized prefill + the
 # long-prefill threshold 1024 (a new chat's first token beside any deep
 # prefill lands in ~1 s), a static decode-under-prefill share of 0.2
-# plus a 2048/step contended-prefill cap (a short request DECODING
+# plus the shipped 4096/step prefill layer (a short request DECODING
 # beside that same prefill: ~1.4 -> ~25 tok/s; the measured ladder sits
 # on the PREFILL_COMPUTE_SHARE comment),
 # b12x kernel autotune OFF (heuristic plans ship as prebuilt
@@ -103,14 +103,15 @@ GMU="${GMU:-0.85}"                        # the eugr recipe's proven budget
 CTX="${CTX:-1048576}"                     # 1M, measured and kept: pool bytes/blocks unchanged (kv-cache-memory-bytes
                                           # pins them); decode in band; deep-prefill admission proven to ~900K with
                                           # the trough well above the floor. The engine's token figure scales with
-                                          # max_model_len; with the capacity overlay the figure is ~4.85M.
+                                          # max_model_len; with the capacity overlay the figure is ~5.1M at the shipped 4096 step budget.
                                           # Quote BLOCKS as the invariant. Do NOT lower without a new boot result.
-MNBT="${MNBT:-${MAX_NUM_BATCHED_TOKENS:-8192}}"   # chunked-prefill batch width. 16384 REJECTED (worker OOM during compile at gmu 0.85); 8192 is the proven posture. Retest only with a memory plan
-LIMIT_MM="${LIMIT_MM:-{\"image\": 32}}"               # vision: images per prompt (0 = tower stubbed); each image caps at 1,024 tokens
+MNBT="${MNBT:-${MAX_NUM_BATCHED_TOKENS:-8192}}"   # chunked-prefill batch width. 16384 REJECTED (worker OOM during compile at gmu 0.85); 8192 is the bare fallback (the shipped profile pins 4096). Retest only with a memory plan
+LIMIT_MM_DEFAULT='{"image": 32}'   # single-quoted literal: a brace-bearing default must never sit inside a ${VAR:-...} expansion
+LIMIT_MM="${LIMIT_MM:-$LIMIT_MM_DEFAULT}"               # vision: images per prompt (0 = tower stubbed); each image caps at 1,024 tokens
 # Serialized prefills ("1") ship: one prefill at a time keeps decode
 # batches pure, which the speculative path pays for directly (measured:
-# the 8-stream aggregate rises from ~140 to ~225 tok/s versus the
-# parallel form) and the threshold flag gives a new chat its ~1 s first
+# the 8-stream aggregate reads its carded ~420 tok/s class (the
+# parallel form pays the mixed-batch cudagraph cost)) and the threshold flag gives a new chat its ~1 s first
 # token. Counts above 1 require the policy knob below (engine-side
 # validation) and were the retired capacity form's posture — FIXLOG
 # 19-21.
@@ -149,7 +150,7 @@ fi
 # expansion in the bootstrap, so any space breaks it into garbage args.
 SPEC_CFG="${SPEC_CFG:-}"
 # 4.8g, the shipped reservation: with the capacity overlay the pool
-# reads ~4.85M tokens (~4.6x at 1M). Quote BLOCKS as the invariant —
+# reads ~5.1M tokens (~4.8x at 1M). Quote BLOCKS as the invariant —
 # read the block count off a healthy boot and hold it constant.
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-4.8g}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
@@ -720,6 +721,7 @@ run_args=(
   # Empty (the default) = no patch = the incumbent routing, byte-identical.
   -e B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS="${B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS:-}"
   -e VLLM_DS41_L2_PREFETCH="${VLLM_DS41_L2_PREFETCH:-1}"
+  -e VLLM_DS41_ATTENTION_COMPUTE="${VLLM_DS41_ATTENTION_COMPUTE:-bf16}"
   # the budget sweep (2026-11): the per-window L2-prefetch fill budgets. GB10's L2 is
   # 24 MB and one layer's live working set is the WO + FFN + NEXT windows
   # together, so the shipped defaults (20+16+20 = 56 MB) stage 2.3x what the
