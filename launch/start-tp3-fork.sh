@@ -21,21 +21,20 @@
 # "disk" is consumed THERE. The "model loading" figure is the non-engram
 # weights; the tables stream at runtime.
 #
-# SERVE LINE: gmu 0.85, kv-cache-memory-bytes 5g (~21,945 blocks; with
-# the capacity overlay ~5.1M tokens), ctx 1048576 (1M; the reservation
-# pins the pool, not ctx), parallel prefills
-# x2 + decode-aware (a short request's first token beside a deep prefill
-# drops from tens of seconds to single-digit seconds, at no measurable
-# long-prefill cost), a static decode-under-prefill share of 0.2 plus a
-# 2048/step contended-prefill cap (a short request DECODING beside that
-# same prefill: ~1.4 -> ~25 tok/s; the first-token price is ~5-6 s versus
-# ~4.6-4.8 s at higher shares; the measured ladder sits on the
-# PREFILL_COMPUTE_SHARE comment),
+# SERVE LINE (the shipped profile in config/cluster.env): gmu 0.85,
+# kv-cache-memory-bytes 4.8g (with the capacity overlay the pool reads
+# ~4.85M tokens at 1M; quote BLOCKS as the invariant), ctx 1048576 (1M;
+# the reservation pins the pool, not ctx), ONE serialized prefill + the
+# long-prefill threshold 1024 (a new chat's first token beside any deep
+# prefill lands in ~1 s), a static decode-under-prefill share of 0.2
+# plus a 2048/step contended-prefill cap (a short request DECODING
+# beside that same prefill: ~1.4 -> ~25 tok/s; the measured ladder sits
+# on the PREFILL_COMPUTE_SHARE comment),
 # b12x kernel autotune OFF (heuristic plans ship as prebuilt
 # cubins; boots in roughly half the tuned time, decode parity, a few
-# percent slower one-time cold prefill), speculative decoding OFF --
-# REJECTED: the drafter's ~3 GiB/rank residency OOMs the head on the
-# first deep prefill at every knob-accessible pool.
+# percent slower one-time cold prefill), DSpark speculative decode k=5
+# ON (~2x single-stream at this pool; the history is the README's
+# Speculative decode section).
 #
 # FABRIC: the RoCE pair and the management interface are site-specific.
 # Set NCCL_IB_HCA and NCCL_SOCKET_IFNAME before booting; find the RoCE
@@ -104,19 +103,17 @@ GMU="${GMU:-0.85}"                        # the eugr recipe's proven budget
 CTX="${CTX:-1048576}"                     # 1M, measured and kept: pool bytes/blocks unchanged (kv-cache-memory-bytes
                                           # pins them); decode in band; deep-prefill admission proven to ~900K with
                                           # the trough well above the floor. The engine's token figure scales with
-                                          # max_model_len; with the capacity overlay the figure is ~5.1M at both.
+                                          # max_model_len; with the capacity overlay the figure is ~4.85M.
                                           # Quote BLOCKS as the invariant. Do NOT lower without a new boot result.
 MNBT="${MNBT:-${MAX_NUM_BATCHED_TOKENS:-8192}}"   # chunked-prefill batch width. 16384 REJECTED (worker OOM during compile at gmu 0.85); 8192 is the proven posture. Retest only with a memory plan
 LIMIT_MM="${LIMIT_MM:-{\"image\": 32}}"               # vision: images per prompt (0 = tower stubbed); each image caps at 1,024 tokens
-# Parallel prefills — measured and kept ("2"): a short request's first token
-# beside a deep prefill drops from tens of seconds to single-digit
-# seconds, at no measurable cost to the long prefill (the shared chunk
-# budget absorbs the small prefill in the big one's inter-chunk gaps).
-# Where it lands inside that band is set by the decode-under-prefill share
-# below (~4.6-4.8 s at shares 0.3-0.5, ~5.8 s at the shipped 0.2).
-# "1" restores legacy single-lane behavior. The policy requires
-# max-parallel-prefills > 1 (engine-side validation) and is only passed
-# when the count is above 1.
+# Serialized prefills ("1") ship: one prefill at a time keeps decode
+# batches pure, which the speculative path pays for directly (measured:
+# the 8-stream aggregate rises from ~140 to ~225 tok/s versus the
+# parallel form) and the threshold flag gives a new chat its ~1 s first
+# token. Counts above 1 require the policy knob below (engine-side
+# validation) and were the retired capacity form's posture — FIXLOG
+# 19-21.
 PAR_PREFILLS="${PAR_PREFILLS:-1}"
 PREFILL_POLICY="${PREFILL_POLICY:-decode-aware}"
 # Decode-under-prefill share — KEEP (measured 2026-11): 0.2 static + 2048/step cap;
@@ -145,19 +142,15 @@ if [ -z "$ENGRAM_CONFIG" ]; then
   # serving wants back. Retest only with a workload that is engram-I/O-bound.
   ENGRAM_CONFIG='{"cpu_offload":false,"table_memory":"disk"}'
 fi
-# DSpark speculative decoding — empty default = OFF. REJECTED, FINAL on
-# this pin (see README): the drafter's residency OOMs the head on the
-# first deep prefill at every knob-accessible pool — engine/OS memory
-# projects reopen it, not this knob. If ever attempted despite that, the
-# JSON must
-# stay COMPACT — it crosses an unquoted word-split expansion in the
-# bootstrap, so any space breaks it into garbage args.
+# DSpark speculative decoding — empty default = OFF is the bare fallback
+# only; the shipped profile in config/cluster.env sets DSpark k=5 (the
+# history is the README's Speculative decode section). However it is
+# set, the JSON must stay COMPACT — it crosses an unquoted word-split
+# expansion in the bootstrap, so any space breaks it into garbage args.
 SPEC_CFG="${SPEC_CFG:-}"
-# 5g, measured and kept (provisional on the trough soak): ~21,945 blocks,
-# ~5.1M tokens / ~4.9x at 1M with the capacity overlay; the 7x512K
-# verification ran at a ~1.7 GB trough (floor 1.6). Drop to 4g if
-# in-service troughs breach the floor (one env; a 24h soak sampler
-# arbitrates).
+# 4.8g, the shipped reservation: with the capacity overlay the pool
+# reads ~4.85M tokens (~4.6x at 1M). Quote BLOCKS as the invariant —
+# read the block count off a healthy boot and hold it constant.
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-4.8g}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-8}"
