@@ -402,6 +402,23 @@ else
   echo "[ds41-fork] head serving (TCPStore ${NODE_IP}:${DIST_MASTER_PORT:-25000})"
   HEADLESS_FLAG=""
 fi
+
+# The session-prefix pin (optional kit at patches/ds41-pin/): resumed
+# sessions keep their first token at the cache-hit class after whole-pool
+# eviction storms. Gated by DS41_PIN (default 1 — the measured posture);
+# DS41_PIN=0 runs stock recycling.
+if [ "${DS41_PIN:-1}" = "1" ]; then
+  if [ ! -f /kit-pin/install.py ]; then
+    echo "[ds41-fork] DS41_PIN=1 but /kit-pin/install.py is ABSENT" >&2
+    exit 1
+  fi
+  python3 /kit-pin/install.py \
+    --vllm-root /usr/local/lib/python3.12/dist-packages/vllm \
+    --apply || exit 1
+  python3 /kit-pin/golden_test.py \
+    --vllm-root /usr/local/lib/python3.12/dist-packages/vllm || exit 1
+  echo "[ds41-fork] session-prefix pin installed + golden test PASS (post-gate)"
+fi
 # Spec decode flag, built here so the serve line never carries a
 # conditional. Empty-default expansion only — a brace-bearing default
 # would terminate early on the JSON (the ENGRAM_CONFIG lesson). The JSON
@@ -671,6 +688,7 @@ run_args=(
   -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT,GRAPH,TUNING,COLL
   -e NCCL_DEBUG_FILE="/tmp/nccl-rank${NODE_RANK:-0}.log"
   -e NCCL_NET=IB -e NCCL_IB_DISABLE=0
+  -v "${PIN_KIT_DIR:-$(cd "$(dirname "$0")/patches/ds41-pin" && pwd)}":/kit-pin:ro \
   -e NCCL_IB_HCA="${NCCL_IB_HCA:?set NCCL_IB_HCA to your RoCE port pair}"
   -e NCCL_CROSS_NIC=1
   -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_IB_SUBNET_PREFIX_LEN=24
@@ -722,6 +740,7 @@ run_args=(
   -e B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS="${B12X_DIRECT_ROUTING_MAX_ROUTED_ROWS:-}"
   -e VLLM_DS41_L2_PREFETCH="${VLLM_DS41_L2_PREFETCH:-1}"
   -e VLLM_DS41_ATTENTION_COMPUTE="${VLLM_DS41_ATTENTION_COMPUTE:-bf16}"
+  -e DS41_PIN="${DS41_PIN:-1}"
   # the budget sweep (2026-11): the per-window L2-prefetch fill budgets. GB10's L2 is
   # 24 MB and one layer's live working set is the WO + FFN + NEXT windows
   # together, so the shipped defaults (20+16+20 = 56 MB) stage 2.3x what the

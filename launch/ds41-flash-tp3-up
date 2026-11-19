@@ -128,6 +128,10 @@ do_stage_env() {
     # rides along from tp3-kit/ as-is.
     scp -q -r "$SCRIPT_DIR/tp3-kit" "$box:~/$REMOTE_DIR/" \
       || die "failed to stage tp3-kit to $box"
+    on "$box" "mkdir -p ~/$REMOTE_DIR/patches" \
+      || die "failed to create patches dir on $box"
+    scp -q -r "$SCRIPT_DIR/../patches/ds41-pin" "$box:~/$REMOTE_DIR/patches/" \
+      || die "failed to stage the pin kit to $box"
   done
   say "stage-env: done"
 }

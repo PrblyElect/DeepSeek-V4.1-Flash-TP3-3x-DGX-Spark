@@ -16,7 +16,8 @@ tags:
 196B engram conditional-memory block) tensor-parallel across three DGX
 Sparks on a 200G RoCE triangle, on a public digest-pinned Docker image.
 The shipped **serving profile**: ~4.8 GiB KV at **1M context** (~5.1M-token
-pool; the whole-pool envelope fill completes end to end), **DSpark k=5**
+pool; envelope-class fills carded on the overlay-kitted stack — see
+the memory section), **DSpark k=5**
 speculative decode, the **paired 4096 deep-prefill layer**, and FP8
 attention internals — **~105 tok/s single-stream counting-class (prose
 ~35–40)**, **~420 tok/s at 8 streams, ~470 at 16**, and **~1 s first token
@@ -144,10 +145,12 @@ DSpark k=5, one serialized prefill, the interactive-admission threshold,
 | Single-stream decode (counting-task) | **~105 tok/s** (prose-class ~35–40) — carded on the shipped stack |
 | Aggregate decode (counting-task, idle lane) | 1× **~105** · 4× **~270** · 8× **~420** · 16× **~470 tok/s** (prose-class spanning ~65–95 across the ladder; zero preemptions) |
 | Deep-prefill wall (cold ~350K, this hardware class) | **~110 s at the shipped 4096 layer** (the threshold-clipped admission price, +31–41 % over an unclipped fill — the documented trade for ~1 s arrivals); short-prefill rates mid-3K tok/s |
-| Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see the next section; the paired 4096 layer held worst-moment available memory in a **~0.6–0.8 GiB band** on both a fresh boot and a memory-drained lane, all fills completing — and the full pool-envelope fill (eight concurrent deep fills) completes end to end on the same layer |
+| Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see the next section; the paired 4096 layer held worst-moment available memory in a **~0.6–0.8 GiB band** across a four-fill house shape on the overlay-kitted stack; **the shipped stack's ceiling is lower (a four-fill shape exhausted it and the memory guard stopped the lane)** — card your own ceiling; the 2048 fallback halves the transient |
 | Arrival TTFT of a NEW short chat beside any deep prefill | **~1 s** (carded 0.93–0.94 s beside a 350K fill; without the threshold the arrival waits the whole prefill). A session resumed with a large cold context additionally pays its own prefill first — roughly 20–30 s per 100K resumed tokens at the published rates |
-| Decode beside a deep prefill | **~15–20 tok/s** per stream with **sub-half-second worst gaps** (carded beside a 400K fill; no stall class at the depths measured — sub-second worst gaps beside a maximum-context fill) |
-| KV reservation / pool | **~4.8 GiB** → **~5.1M tokens (~4.8× at 1M)** at the shipped 4096 step budget; whole-pool-envelope fill completes end to end |
+| Decode beside a deep prefill | **~15–20 tok/s** per stream with **sub-half-second worst gaps** (carded beside a 400K fill on the shipped stack; no stall class at
+the depths measured) |
+| KV reservation / pool | **~4.8 GiB** → **~5.1M tokens (~4.8× at 1M)** at the shipped 4096 step budget; envelope-class fills carded on the
+overlay-kitted stack (see the memory section) |
 | Engram drain-sync | deleted by the host-hash kit: ~8% → **~2%** of worker wall-time |
 | Quality | clean across the acceptance gates (FIXLOG 21/22) |
 
@@ -173,23 +176,28 @@ loaded box, that transient is what reaches kernel-OOM territory (FIXLOG
 The fix composes with the 4096 layer: cap the budget to 4096 and
 a lone request's chunk still fills the whole step — **the layer's solo
 speed is kept**, concurrent cold prefills share the smaller step, and the
-transient roughly halves. Measured with four concurrent ~350K cold fills:
+transient roughly halves. Measured (on the overlay-kitted stack) with four concurrent ~350K
+cold fills:
 worst-moment available memory held a **~0.6–0.8 GiB band** on a fresh
 boot, and again — same band, same completion count, same aggregate rate —
 on a memory-drained lane immediately after. That is the shipped form of
 the layer (the live block in `config/cluster.env`; the 2048 form is the
 commented conservative fallback).
 
-The paired layer has since been pushed to the box's worst shapes: the
-full pool-envelope fill — eight concurrent deep fills, the sequence cap
-saturated — completed end to end with host available memory never
-approaching the kernel-OOM line (an envelope run rides a few hundred MiB
-for its duration; plan co-tenants accordingly); and a maximum-context
-single request ran with an interactive stream decoding beside it the
-whole time, holding sub-second worst gaps. Deep-fill walls at the 4096
-step pay the documented threshold class (+31–41 %), and long-context
-retrieval was re-verified at full depth on this geometry (3/3 at the
-context limit).
+Concurrent-fill ceilings were measured to the box's worst shapes on a
+stack carrying an expert-packing overlay (a follow-up kit, not yet
+shipped as of this version): there, the full pool-envelope fill — eight
+concurrent deep fills, the sequence cap saturated — completed end to end
+never approaching the kernel-OOM line, and a maximum-context request ran
+with interactive decode beside it at sub-second gaps. **On the stack
+this recipe ships (without that overlay), the concurrent deep-fill
+ceiling is materially lower: a four-fill house shape exhausted headroom
+and the memory guard stopped the lane.** Card your own ceiling with the
+fill probe before promising co-tenants the envelope; the conservative
+2048 fallback halves the transient and buys the margin back. Deep-fill
+walls at the 4096 step pay the documented threshold class (+31–41 %),
+and long-context retrieval was re-verified at full depth on this
+geometry (3/3 at the context limit).
 
 Also budget-relevant: `MAX_NUM_BATCHED_TOKENS` is the knob whose
 **raising** has killed worker ranks outright — 16384 OOM-killed both
@@ -551,6 +559,13 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.6.0 — the pin kit + the ceiling correction)** — the
+  session-prefix pin shipped as a kit (`patches/ds41-pin/`, on by
+  default; install + torch-free golden run at boot, post-gate); and a
+  carding fill on the shipped stack found the concurrent deep-fill
+  ceiling claims needed scoping — the envelope-class receipts belong to
+  the overlay-kitted stack, and the shipped stack's four-fill shape
+  exhausted headroom (the memory guard stopped the lane, as designed).
 - **2026-11 (v1.5.0 — the reconciliation + first true carding)** — the
   best-found levers shipped: the paired 4096 layer promoted to the
   shipped default and FP8 attention internals folded in (with the
@@ -558,7 +573,8 @@ same gate asserts).
   ON the shipped configuration (single-stream ~105 counting-class,
   c16 ~470); two shipped-since-the-start defects found and fixed by the
   carding boot itself (FIXLOG 29–30).
-- **2026-11 (hardening receipts)** — the paired 4096 layer proven to the
+- **2026-11 (hardening receipts, on the overlay-kitted stack — see
+  v1.6.0)** — the paired 4096 layer proven to the
   box's worst shapes: the full pool-envelope fill (eight concurrent deep
   fills) end to end, a maximum-context request with interactive decode
   beside it, retrieval re-verified at the context limit; and the
