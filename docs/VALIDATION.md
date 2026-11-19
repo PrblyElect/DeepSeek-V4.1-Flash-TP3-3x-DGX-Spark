@@ -1,8 +1,7 @@
 # VALIDATION — ds41-flash-tp3
 
-Acceptance gates for the shipped profiles (the serving profile is the
-default; the capacity alternative is documented in the README). Run
-after every boot.
+Acceptance gates for the shipped (serving) profile. Run after every
+boot.
 
 **Where each gate runs.** Gates 1–5, gate 9 and gate 10 are plain HTTP and run
 from anywhere that can reach the head box. Gates 6–8 shell out to the
@@ -92,22 +91,21 @@ time curl -s http://HEAD_IP:8600/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"main","messages":[{"role":"user","content":"Write a detailed paragraph about ocean currents."}],"max_tokens":250,"temperature":0}' | \
   jq '.usage.completion_tokens'
-# expected: 250 tokens in ~7 s on the capacity alternative (~35 tok/s
-#           with the shipped kernel stack; ~31 tok/s without the
-#           LM-head backend + L2 set-aside). The default serving profile
-#           (DSpark k=5) reads ~2x the no-spec lane on counting-class
-#           prompts; this gate's prompt is prose, so treat ~7 s as the
-#           no-spec reference point there, not a failure bound.
+# expected: 250 tokens in a single-digit-second window (the shipped
+#           stack's no-spec reference is ~35 tok/s; with DSpark k=5
+#           counting-class prompts read ~2x the no-spec lane, but this
+#           gate's prompt is prose — treat the no-spec window as the
+#           reference point, not a failure bound).
 ```
 
 ## 6. KV pool (from boot log)
 
 ```sh
 docker logs ds41-flash-tp3 2>&1 | grep "GPU KV cache size"
-# expected: ~4.85M tokens on the default serving profile (roughly 4.6x
-# at a 1,048,576-token context) or ~5.1M on the capacity alternative
-# (roughly 4.9x), with the capacity overlay installed; quote the block
-# count as the invariant (~21,945 at the 5 GiB capacity reservation)
+# expected: ~4.85M tokens (roughly 4.6x at a 1,048,576-token context)
+# with the capacity overlay installed; quote the block count as the
+# invariant (it is reservation-pinned — read it off your own healthy
+# boot and hold it constant)
 ```
 
 ## 7. Image identity
@@ -184,7 +182,7 @@ the same startup dump — read that line off a real serving boot and
 update `resolved_backends.expect.spec_decode` in
 `launch/tp3-kit/engine-identity.json` to it (the check interpolates the
 expected value into a value-bearing log marker, so a guessed string
-fails). Switching profiles is a gated, recorded decision, like a fabric
+fails). Switching posture is a gated, recorded decision, like a fabric
 change.
 
 ## 9. Long-prompt determinism (crosses the chunked-prefill boundary)
