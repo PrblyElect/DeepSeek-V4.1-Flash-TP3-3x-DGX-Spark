@@ -102,10 +102,11 @@ time curl -s http://HEAD_IP:8600/v1/chat/completions \
 
 ```sh
 docker logs ds41-flash-tp3 2>&1 | grep "GPU KV cache size"
-# expected: ~4.85M tokens (roughly 4.6x at a 1,048,576-token context)
-# with the capacity overlay installed; quote the block count as the
-# invariant (it is reservation-pinned — read it off your own healthy
-# boot and hold it constant)
+# expected: ~5.1M tokens (roughly 4.8x at a 1,048,576-token context) at
+# the shipped 4096 step budget (~4.85M on the 8192 fallback), with the
+# capacity overlay installed; quote the block count as the invariant (it
+# is reservation-pinned — read it off your own healthy boot and hold it
+# constant)
 ```
 
 ## 7. Image identity
