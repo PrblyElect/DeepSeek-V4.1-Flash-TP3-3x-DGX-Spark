@@ -132,6 +132,8 @@ do_stage_env() {
       || die "failed to create patches dir on $box"
     scp -q -r "$SCRIPT_DIR/../patches/ds41-pin" "$box:~/$REMOTE_DIR/patches/" \
       || die "failed to stage the pin kit to $box"
+    scp -q -r "$SCRIPT_DIR/../patches/ds41-w3" "$box:~/$REMOTE_DIR/patches/" \
+      || die "failed to stage the w3 kit to $box"
   done
   say "stage-env: done"
 }

@@ -419,6 +419,22 @@ if [ "${DS41_PIN:-1}" = "1" ]; then
     --vllm-root /usr/local/lib/python3.12/dist-packages/vllm || exit 1
   echo "[ds41-fork] session-prefix pin installed + golden test PASS (post-gate)"
 fi
+
+# The coded expert-scales overlay (patches/ds41-w3/): five kernel files
+# copied over the b12x MoE shared-kernel dir — ~2.5 GiB/rank of
+# weights-side memory back at stock-equivalent quality. DS41_W3=0 runs
+# the stock kernel files (fail-closed: the copy never happens).
+if [ "${DS41_W3:-1}" = "1" ]; then
+  _w3_dst=/usr/local/lib/python3.12/dist-packages/flashinfer/experimental/b12x/moe/_shared/kernels
+  for _wf in dynamic.py tiny_decode.py w4a8_phase1.py w4a8_phase2.py w3_coded_common.py; do
+    if [ ! -f "/kit-w3/$_wf" ]; then
+      echo "[ds41-fork] DS41_W3=1 but /kit-w3/$_wf is ABSENT" >&2
+      exit 1
+    fi
+    cp "/kit-w3/$_wf" "$_w3_dst/$_wf"
+    echo "[ds41-fork] w3 overlay installed: $_wf"
+  done
+fi
 # Spec decode flag, built here so the serve line never carries a
 # conditional. Empty-default expansion only — a brace-bearing default
 # would terminate early on the JSON (the ENGRAM_CONFIG lesson). The JSON
@@ -689,6 +705,7 @@ run_args=(
   -e NCCL_DEBUG_FILE="/tmp/nccl-rank${NODE_RANK:-0}.log"
   -e NCCL_NET=IB -e NCCL_IB_DISABLE=0
   -v "${PIN_KIT_DIR:-$(cd "$(dirname "$0")/patches/ds41-pin" && pwd)}":/kit-pin:ro \
+  -v "${W3_KIT_DIR:-$(cd "$(dirname "$0")/patches/ds41-w3" && pwd)}":/kit-w3:ro \
   -e NCCL_IB_HCA="${NCCL_IB_HCA:?set NCCL_IB_HCA to your RoCE port pair}"
   -e NCCL_CROSS_NIC=1
   -e NCCL_IB_SUBNET_AWARE_ROUTING=1 -e NCCL_IB_SUBNET_PREFIX_LEN=24
@@ -741,6 +758,7 @@ run_args=(
   -e VLLM_DS41_L2_PREFETCH="${VLLM_DS41_L2_PREFETCH:-1}"
   -e VLLM_DS41_ATTENTION_COMPUTE="${VLLM_DS41_ATTENTION_COMPUTE:-bf16}"
   -e DS41_PIN="${DS41_PIN:-1}"
+  -e DS41_W3="${DS41_W3:-1}"
   # the budget sweep (2026-11): the per-window L2-prefetch fill budgets. GB10's L2 is
   # 24 MB and one layer's live working set is the WO + FFN + NEXT windows
   # together, so the shipped defaults (20+16+20 = 56 MB) stage 2.3x what the
