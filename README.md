@@ -474,7 +474,7 @@ the answer — give `max_tokens ≥ ~200`; and per-image identification stays
 strong at the limit while aggregate counting drifts (a 32-image batch
 counted as 30).
 
-## Speculative decode: the shipped default
+## Speculative decode: the shipped default and the depth dial
 
 DSpark k=5 ships on the serving profile. The measured facts that shaped
 it:
@@ -495,9 +495,42 @@ it:
   percent; per-batch depths + serialization compose but drop the
   deep-prefill trough under the floor, so the shipped profile is the
   plain k=5 drafter with one serialized prefill.
-- **A middle tier exists (measured)**: a 3.0 GiB pool with k=3 reads
-  ~2.7× at 1M and solo ~49–58 tok/s — strong at ≤4 streams (~131 tok/s
-  aggregate), drops at 8. A niche option, documented in FIXLOG 21/22.
+
+**The depth dial, measured at the full pool (v1.8.0)** — `k` trades the
+counting class against concurrent prose, and both ends are receipted on
+this hardware class (greedy, identical prompts, three repetitions each,
+aggregate across concurrent streams; bands, not single-point claims):
+
+| depth | single-stream prose | 4–8 concurrent streams | counting-style single-stream |
+|---|---|---|---|
+| k=3 (+ `MAX_NUM_SEQS=12`) | ~flat vs k=5 | **~+10–15 % aggregate** | ~−25–30 % |
+| k=5 (shipped) | baseline | baseline | baseline |
+| k=7 | ~−15 % | ~−15 % | ~+15 % |
+
+The k=3 row's properties worth knowing before switching:
+
+- **Outputs are unchanged by construction**: greedy decoding with
+  block-rejection acceptance reproduces byte-identical text across
+  depths — verified across single- and multi-stream captures (the
+  acceptance-rejection contract is exact, not approximate).
+- **Acceptance rises as depth falls** (~0.45–0.50 accepted per drafted
+  token at k=3 vs ~0.33 at k=5 on prose), which is why single-stream
+  holds flat while the concurrent aggregate climbs.
+- **The trade is real**: counting- and repetition-style single-stream
+  work (enumerate, transcribe) loses roughly a quarter to a third at
+  k=3. Pick by your traffic mix: concurrent chats and agent churn →
+  k=3 with `MAX_NUM_SEQS=12`; mixed or unknown → k=5; single-stream
+  structured work → k=7.
+- Raising `MAX_NUM_SEQS` to 12 with k=3 showed **zero preemptions**
+  across the churn battery and no memory-regression (the pool figure is
+  unchanged to the token).
+
+To fly the concurrent-serving tier: set
+`num_speculative_tokens=3` in `SPEC_CFG` and `MAX_NUM_SEQS=12` in
+`config/cluster.env` (or your profile). Everything else in the recipe
+applies unchanged. The earlier k=3 note (a 3.0 GiB middle tier, FIXLOG
+21/22) described the pool-constrained era; the full-pool dial above
+supersedes it.
 
 ## Comparison with other V4.1-Flash recipes
 
@@ -557,6 +590,14 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.8.0 — the depth dial, receipted)** — the speculative-decode
+  section gains the measured depth table at the full pool: k=3 with
+  `MAX_NUM_SEQS=12` reads ~+10–15 % aggregate at 4–8 concurrent streams
+  with single-stream flat and byte-identical outputs (acceptance rises to
+  ~0.45–0.50 per drafted token), at a ~25–30 % cost to counting-style
+  single-stream; k=7 inverts the trade. The shipped default stays k=5 —
+  the dial is a documented, one-line switch per traffic mix. The earlier
+  pool-constrained k=3 note is superseded.
 - **2026-11 (v1.7.0 — the coded expert-scales kit)** — `patches/ds41-w3/`
   ships (five kernel files, md5-pinned, ON by default): ~2.5 GiB/rank of
   weights-side memory back at stock-equivalent quality — the kit that
