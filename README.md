@@ -568,6 +568,40 @@ MMLU items, letter-only, bootstrap CI) against the incumbent's own run on
 the same items. The validated build read knowledge parity (a delta inside
 its own bootstrap noise) with the pool unchanged to the token.
 
+**The delta splice: the edited tensors only (~1.2 GiB instead of
+~160 GiB).** For the build validated here, the edit is small at the tensor
+level — **at most 92 of the model's 96,085 tensors**: the refusal
+direction projected out of two projections (the attention output projection
+and the shared-expert down projection) across 23 layers. One layer's tensors
+per shard *file*, so the edit sits across 23 of the 48 files — which is why
+the shard route costs ~160 GiB. `tools/splice-delta.py` takes the other route:
+
+- it reads the tensor list for the build from a small manifest
+  (`tools/abliterated-delta-moonmath.json`),
+- fetches **only those tensors' byte ranges** from the publisher's shard
+  files over HTTP range requests (no whole shard is downloaded — this tool
+  hosts and redistributes no weight bytes),
+- writes them into rebuilt copies of the base shards — the build's own
+  shard header byte-for-byte, the base's data with the edited ranges
+  replaced (the two layouts are asserted identical per shard first),
+- **verifies every rebuilt shard against the publisher's published
+  SHA-256** and deletes any mismatch, so an incomplete tensor list fails
+  closed instead of producing a checkpoint that silently differs from the
+  publisher's,
+- hard-links the 25 identical shards and copies + verifies the metadata
+  files, then writes a provenance marker.
+
+```sh
+python3 tools/splice-delta.py --base-dir /path/to/deepseek-v4.1-flash-1017 \
+    --manifest tools/abliterated-delta-moonmath.json
+# -> a sibling directory, bit-for-bit the publisher's build
+```
+
+Roughly a hundred times less download than the shard route, at the cost of
+~160 GiB of local disk for the rebuilt shards and a few minutes of local
+copying. The result is the same checkpoint either way — serve it exactly as
+described above.
+
 The validated build referenced above is
 `MoonMath-ai/DeepSeek-V4.1-Flash-1017-uncensored` — an external community
 build, used here as weights input only.
@@ -630,6 +664,13 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.10.0 — the delta splice)** — `tools/splice-delta.py`
+  builds an alternate-weights checkpoint from the base checkpoint plus only
+  the tensors the build edits, fetched as HTTP byte ranges from the
+  publisher's shards (~1.2 GiB for the validated build, vs ~160 GiB by the
+  shard route). Every rebuilt shard is verified against the publisher's
+  published SHA-256 and any mismatch is deleted — the splice fails closed.
+  The tool hosts and redistributes no weight bytes.
 - **2026-11 (v1.9.0 — alternate weights as a switchable alias)** — the
   launcher's `--served-model-name` is unquoted (multiple served names:
   `SERVED_MODEL_NAME="uncensored main"`; single-word values byte-identical),
