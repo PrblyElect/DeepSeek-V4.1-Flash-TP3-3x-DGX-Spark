@@ -510,7 +510,7 @@ exec vllm serve /model \
   --max-model-len "${CTX}" \
   --gpu-memory-utilization "${GMU:-0.85}" \
   --kv-cache-memory-bytes "${KV_CACHE_MEMORY_BYTES:-5g}" \
-  --served-model-name "${SERVED_MODEL_NAME:-main}" \
+  --served-model-name ${SERVED_MODEL_NAME:-main} \
   --limit-mm-per-prompt "${LIMIT_MM}" \
   --port "${PORT:-8600}" \
   --block-size "${BLOCK_SIZE:-256}" \
