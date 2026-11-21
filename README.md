@@ -302,9 +302,11 @@ manually: `sync; echo 3 > /proc/sys/vm/drop_caches`).
 
 The vocabulary (129,280) does not divide by 3. The fork's runtime TP3
 padding handles attention heads, o_groups and drafter experts, so the
-checkpoint is the natural pull, and the lane serves a single name
-(`main`). Treat the single-served-name posture as the requirement — the
-assertion that fired during bring-up is not present in the pinned build.
+checkpoint is the natural pull, and the lane served a single name
+(`main`) through v1.8.0 — since v1.9.0 a profile may serve multiple names
+(`SERVED_MODEL_NAME="uncensored main"`); single-name values are unchanged.
+The name-assertion that fired during bring-up is not present in the
+pinned build.
 
 ### 6. io_uring requires seccomp=unconfined in Docker
 
@@ -361,7 +363,7 @@ LIMIT_MM='{"image": 32}'           # 0 = text-only (the ViT tower stubs)
 LOAD_FORMAT=b12x                   # ~32 s load; safetensors = conservative fallback
 ENGRAM_CONFIG='{"cpu_offload":false,"table_memory":"disk"}'
 MOE_BACKEND=b12x                   # with B12X_W4A8_TINY_DECODE=0 (the clamp kill switch)
-PORT=8600; TP=3; SERVED_MODEL_NAME=main   # single alias; wall 5
+PORT=8600; TP=3; SERVED_MODEL_NAME=main   # served names (one or more since v1.9.0); wall 5
 
 # NCCL (the critical caps — wall 1)
 NCCL_BUFFSIZE=1048576; NCCL_LL128_BUFFSIZE=262144
@@ -532,6 +534,44 @@ applies unchanged. The earlier k=3 note (a 3.0 GiB middle tier, FIXLOG
 21/22) described the pool-constrained era; the full-pool dial above
 supersedes it.
 
+## Alternate weights: abliterated builds as a switchable alias
+
+The recipe runs any checkpoint with the same architecture. Abliterated
+(uncensored) community builds of this model are a drop-in **weights swap**:
+identical mechanics (the KV pool, boot gate and step walls were unchanged
+to the token in validation), different behavior. The safe pattern, measured
+end to end on this hardware class:
+
+**Splice, don't copy.** Diff the build's published shard manifest against
+the base checkpoint's: for the build validated here, **23 of 48 shards
+differ**; the other 25 are byte-identical and can be **hard-linked** from
+the already-staged base checkpoint (zero extra bytes), with the four
+metadata files taken from the base (verify them against the publisher's
+manifest). SHA-256-verify every fetched shard against the publisher's
+published manifest before trusting it — never a local checksum file alone.
+
+**Switch by alias, not by overwrite.** Keep the base checkpoint as the
+default `MODEL_DIR` and add a second profile that differs by exactly
+`MODEL_DIR` (the spliced build) plus an alias — and since v1.9.0 the
+launcher accepts **multiple served names**
+(`SERVED_MODEL_NAME="uncensored main"`), so clients pinned to either name
+keep working and the weights in force are always distinguishable at the
+API. One boot switches between the profiles; nothing is deleted.
+
+**Gate the swap, don't trust the card.** A weights change is the one class
+where a benchmark cannot catch the failure. The veto set that shipped this
+build, all pre-declared before the first boot: the capability battery
+(14/14, identical to the incumbent), a degeneration band from **two**
+baseline runs of the incumbent, refusal/empty rates, a million-token
+needle retrieval, a NaN gate, and a **paired** knowledge axis (285 fixed
+MMLU items, letter-only, bootstrap CI) against the incumbent's own run on
+the same items. The validated build read knowledge parity (a delta inside
+its own bootstrap noise) with the pool unchanged to the token.
+
+The validated build referenced above is
+`MoonMath-ai/DeepSeek-V4.1-Flash-1017-uncensored` — an external community
+build, used here as weights input only.
+
 ## Comparison with other V4.1-Flash recipes
 
 Every figure in the other rows is **other people's published number**,
@@ -590,6 +630,17 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.9.0 — alternate weights as a switchable alias)** — the
+  launcher's `--served-model-name` is unquoted (multiple served names:
+  `SERVED_MODEL_NAME="uncensored main"`; single-word values byte-identical),
+  and the README gains the abliterated-builds section: the splice method
+  (manifest-diff, hard-link the identical shards, SHA-verify every fetched
+  shard against the publisher manifest), the alias-switch pattern, and the
+  pre-declared veto set that gates any weights swap (capability battery,
+  two-baseline degeneration band, needle, NaN, paired knowledge axis).
+  One community abliterated build is referenced as validated end to end on
+  this hardware class: knowledge parity inside its own bootstrap noise,
+  pool unchanged to the token.
 - **2026-11 (v1.8.0 — the depth dial, receipted)** — the speculative-decode
   section gains the measured depth table at the full pool: k=3 with
   `MAX_NUM_SEQS=12` reads ~+10–15 % aggregate at 4–8 concurrent streams
