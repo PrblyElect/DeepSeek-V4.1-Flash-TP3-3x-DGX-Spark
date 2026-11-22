@@ -358,7 +358,7 @@ MAX_NUM_BATCHED_TOKENS=4096        # the step budget — the MEMORY lever
                                    # do NOT raise — 16384 OOM-killed both workers
                                    # in the compile phase (FIXLOG 9)
 BLOCK_SIZE=256                     # the sparse-SWA backend's preferred size
-LIMIT_MM='{"image": 32}'           # 0 = text-only (the ViT tower stubs)
+LIMIT_MM='{"image": 1024}'         # the natural ceiling — the context window is the only image limit (0 = text-only, the ViT tower stubs)
 
 LOAD_FORMAT=b12x                   # ~32 s load; safetensors = conservative fallback
 ENGRAM_CONFIG='{"cpu_offload":false,"table_memory":"disk"}'
@@ -466,7 +466,11 @@ native path on any mismatch.
 The 1017 checkpoint carries a 32-layer ViT tower, and the fork ships the
 matching image processor (constructed from the model config — no
 `preprocessor_config.json`). The tower is built unconditionally; serving
-it is one flag: `LIMIT_MM='{"image": 32}'` (0 = text-only, tower stubbed).
+it is one flag: `LIMIT_MM='{"image": 1024}'` (0 = text-only, tower
+stubbed). Since v1.11.0 the default is the engine's natural ceiling —
+1024 = the context window ÷ 1,024 tokens per image — so the context
+length, not an image counter, is the only limit; the encoder's working
+buffer is a fixed size regardless of this value.
 Verified live: exact shape/color/position recovery through the
 OpenAI-compatible endpoint; a 12-image ordered identification 12/12 in
 ~4 s; a full 32-image batch in ~4 s (~185 tokens per image after
@@ -664,6 +668,13 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.11.0 — the image cap at its natural ceiling)** — the
+  default `LIMIT_MM` raised from 32 to 1024 images per prompt
+  (= the context window ÷ 1,024 tokens per image). The engine's own
+  effective cap was already `min(limit, context ÷ 1024)` and the encoder's
+  working buffer is a fixed size regardless of the knob — so the only
+  behavior change is that heavy-vision prompts no longer hit an artificial
+  400; the context-length error becomes the sole guard (FIXLOG 33).
 - **2026-11 (v1.10.0 — the delta splice)** — `tools/splice-delta.py`
   builds an alternate-weights checkpoint from the base checkpoint plus only
   the tensors the build edits, fetched as HTTP byte ranges from the

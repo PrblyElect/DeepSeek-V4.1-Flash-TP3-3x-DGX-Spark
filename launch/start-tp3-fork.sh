@@ -106,8 +106,8 @@ CTX="${CTX:-1048576}"                     # 1M, measured and kept: pool bytes/bl
                                           # max_model_len; with the capacity overlay the figure is ~5.1M at the shipped 4096 step budget.
                                           # Quote BLOCKS as the invariant. Do NOT lower without a new boot result.
 MNBT="${MNBT:-${MAX_NUM_BATCHED_TOKENS:-8192}}"   # chunked-prefill batch width. 16384 REJECTED (worker OOM during compile at gmu 0.85); 8192 is the bare fallback (the shipped profile pins 4096). Retest only with a memory plan
-LIMIT_MM_DEFAULT='{"image": 32}'   # single-quoted literal: a brace-bearing default must never sit inside a ${VAR:-...} expansion
-LIMIT_MM="${LIMIT_MM:-$LIMIT_MM_DEFAULT}"               # vision: images per prompt (0 = tower stubbed); each image caps at 1,024 tokens
+LIMIT_MM_DEFAULT='{"image": 1024}'  # single-quoted literal: a brace-bearing default must never sit inside a ${VAR:-...} expansion; 1024 = max_model_len // 1024 tokens-per-image — the natural ceiling (the context window is the only image limit)
+LIMIT_MM="${LIMIT_MM:-$LIMIT_MM_DEFAULT}"               # vision: images per prompt (0 = tower stubbed); each image caps at 1,024 tokens, so 1024 == the context window as the only limit
 # Serialized prefills ("1") ship: one prefill at a time keeps decode
 # batches pure, which the speculative path pays for directly (measured:
 # the 8-stream aggregate reads its carded ~420 tok/s class (the
