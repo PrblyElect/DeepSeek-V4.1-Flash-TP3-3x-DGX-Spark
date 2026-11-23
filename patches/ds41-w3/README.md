@@ -10,13 +10,12 @@ per rank of weights-side memory at stock-equivalent quality and speed**
 ## Why it matters on this hardware
 
 GB10 is unified-memory: weights-side savings are host-memory savings.
-On the stack this recipe ships (without this overlay), the concurrent
-deep-fill ceiling is limited — a four-fill house shape exhausted headroom
-and the memory guard stopped the lane (the README's memory section). With
-the overlay armed, the same class of shapes rides a materially higher
-margin: the whole-pool envelope fill (eight concurrent deep fills)
-completes end to end. **This kit is what moves the envelope-class
-receipts onto the shipped stack.**
+On the stack this recipe ships without this overlay, a four-fill house
+shape exhausted headroom and the memory guard stopped the lane (the
+README's memory section). With the overlay armed, the same class of
+shapes rides a materially wider margin — eight concurrent deep fills
+complete end to end. **This kit is what keeps the lane up under load
+instead of being stopped by its own memory guard.**
 
 ## What it changes
 
@@ -55,5 +54,5 @@ md5sum -c OVERLAY-MD5   # (macOS: md5 -r *.py and compare by eye)
 
 Measured on this hardware class: ~2.5 GiB/rank of weights-side memory
 returned; expert-path speed stock-equivalent; the memory story is the
-entire point. See the README's memory section for the ceiling receipts
+entire point. See the README's memory section for the headroom results
 with the overlay armed.

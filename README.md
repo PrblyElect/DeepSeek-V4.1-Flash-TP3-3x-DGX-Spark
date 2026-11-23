@@ -15,12 +15,13 @@ tags:
 **TL;DR** — Serve DeepSeek-V4.1-Flash (552B total, native FP4+FP8 MoE with a
 196B engram conditional-memory block) tensor-parallel across three DGX
 Sparks on a 200G RoCE triangle, on a public digest-pinned Docker image.
-The shipped **serving profile**: ~4.8 GiB KV at **1M context** (~5.1M-token
-pool; with the coded expert-scales kit armed, the envelope fill completes end to end — see the memory section), **DSpark k=5**
-speculative decode, the **paired 4096 deep-prefill layer**, and FP8
-attention internals — **~105 tok/s single-stream counting-class (prose
-~35–40)**, **~420 tok/s at 8 streams, ~470 at 16**, and **~1 s first token
-for a chat arriving beside any deep prefill** (carded 0.93–0.94 s). A cold
+The shipped **serving profile** is tuned to stay up and stay interactive
+under load, not to maximize the pool: ~4.8 GiB KV at **1M context**
+(~5.1M-token pool), **DSpark k=5** speculative decode, the **paired
+4096 deep-prefill layer**, and FP8 attention internals — **~105 tok/s
+single-stream counting-class (prose ~35–40)**, **~420 tok/s at 8 streams,
+~470 at 16**, and **~1 s first token for a chat arriving beside any deep
+prefill** (carded 0.93–0.94 s). A cold
 boot loads weights in **~32 s**. Every figure is carded on the shipped
 configuration itself (FIXLOG 27 for the memory pairing: cap
 `MAX_NUM_BATCHED_TOKENS`, not the chunk, and the concurrent cold-prefill
@@ -135,20 +136,21 @@ recipe has already been bitten by (FIXLOG).
 
 One profile (gmu 0.85, 1M context, kernel autotune off, engram on NVMe).
 
-**The serving profile** (~4.8 GiB KV + the capacity overlay,
-DSpark k=5, one serialized prefill, the interactive-admission threshold,
-`MAX_NUM_SEQS=8 or 16`, the host-hash kit):
+**The serving profile** (~4.8 GiB KV with the KV-accounting overlay —
+the "capacity overlay" below — DSpark k=5, one serialized prefill, the
+interactive-admission threshold, `MAX_NUM_SEQS=8 or 16`, the host-hash
+kit):
 
 | Metric | Value |
 |---|---|
 | Single-stream decode (counting-task) | **~105 tok/s** (prose-class ~35–40) — carded on the shipped stack |
 | Aggregate decode (counting-task, idle lane) | 1× **~105** · 4× **~270** · 8× **~420** · 16× **~470 tok/s** (prose-class spanning ~65–95 across the ladder; zero preemptions) |
 | Deep-prefill wall (cold ~350K, this hardware class) | **~110 s at the shipped 4096 layer** (the threshold-clipped admission price, +31–41 % over an unclipped fill — the documented trade for ~1 s arrivals); short-prefill rates mid-3K tok/s |
-| Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see the next section; the paired 4096 layer (with the coded expert-scales kit, the shipped default) held worst-moment available memory in a **~0.6–0.8 GiB band** across a four-fill house shape — and the full pool-envelope fill (eight concurrent deep fills) completes end to end; with `DS41_W3=0` the ceiling is materially lower — card your own |
+| Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see the next section; the paired 4096 layer (with the coded expert-scales kit, the shipped default) held worst-moment available memory in a **~0.6–0.8 GiB band** across a four-fill house shape, and eight concurrent deep fills complete end to end; with `DS41_W3=0` the margin is materially thinner — card your own |
 | Arrival TTFT of a NEW short chat beside any deep prefill | **~1 s** (carded 0.93–0.94 s beside a 350K fill; without the threshold the arrival waits the whole prefill). A session resumed with a large cold context additionally pays its own prefill first — roughly 20–30 s per 100K resumed tokens at the published rates |
 | Decode beside a deep prefill | **~15–20 tok/s** per stream with **sub-half-second worst gaps** (carded beside a 400K fill on the shipped stack; no stall class at
 the depths measured) |
-| KV reservation / pool | **~4.8 GiB** → **~5.1M tokens (~4.8× at 1M)** at the shipped 4096 step budget; with the coded expert-scales kit armed, the envelope fill completes (see the memory section) |
+| KV reservation / pool | **~4.8 GiB** → **~5.1M tokens (~4.8× at 1M)** at the shipped 4096 step budget — sized for headroom under load, not for the largest possible figure (see the next section) |
 | Engram drain-sync | deleted by the host-hash kit: ~8% → **~2%** of worker wall-time |
 | Quality | clean across the acceptance gates (FIXLOG 21/22) |
 
@@ -182,20 +184,23 @@ on a memory-drained lane immediately after. That is the shipped form of
 the layer (the live block in `config/cluster.env`; the 2048 form is the
 commented conservative fallback).
 
-Concurrent-fill ceilings were measured to the box's worst shapes.
-**With the coded expert-scales kit armed (`patches/ds41-w3/` — shipped,
-and ON by default since v1.7.0), the full pool-envelope fill — eight
-concurrent deep fills, the sequence cap saturated — completes end to end
-never approaching the kernel-OOM line, and a maximum-context request
-runs with interactive decode beside it at sub-second gaps.** With
-`DS41_W3=0` (stock kernel files), the ceiling is materially lower: a
+How far that margin goes was checked at the box's worst shapes — as a
+headroom test, not a capacity target. **With the coded expert-scales kit
+armed (`patches/ds41-w3/` — shipped, and ON by default since v1.7.0),
+eight concurrent deep fills — the sequence cap saturated — complete end
+to end without approaching the kernel-OOM line, and a maximum-context
+request keeps interactive decode beside them at sub-second gaps.** With
+`DS41_W3=0` (stock kernel files), the margin is materially thinner: a
 four-fill house shape exhausted headroom and the memory guard stopped
-the lane. Card your own ceiling with the fill probe before promising
-co-tenants the envelope; the conservative 2048 fallback halves the
-transient and buys the margin back either way. Deep-fill
-walls at the 4096 step pay the documented threshold class (+31–41 %),
-and long-context retrieval was re-verified at full depth on this
-geometry (3/3 at the context limit).
+the lane. This recipe does not chase the envelope: the pool is sized so
+the box has room to stay interactive. Pushing the reservation higher
+buys little usable capacity, because the fill-time memory trough is
+what binds on this stack, not pool occupancy (FIXLOG 20). Card your own
+margin with the fill probe before promising co-tenants anything; the
+conservative 2048 fallback halves the transient and buys the margin
+back either way. Deep-fill walls at the 4096 step pay the documented
+threshold class (+31–41 %), and long-context retrieval was re-verified
+at full depth on this geometry (3/3 at the context limit).
 
 Also budget-relevant: `MAX_NUM_BATCHED_TOKENS` is the knob whose
 **raising** has killed worker ranks outright — 16384 OOM-killed both
@@ -668,6 +673,15 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.12.0 — capacity out of the headline)** — a framing
+  cleanup, no number or default changed: the recipe had drifted back to
+  leading with pool size and the eight-concurrent-deep-fill result. The
+  TL;DR now states what the profile is for (staying up and interactive
+  under load), the fill result no longer leads — it is reported in the
+  memory section as a headroom test, not a capacity target — and the coded
+  expert-scales kit's rationale is stated as keeping the lane up under
+  load rather than as moving envelope-class receipts. The KV-accounting
+  patch keeps its name (the "capacity overlay").
 - **2026-11 (v1.11.0 — the image cap at its natural ceiling)** — the
   default `LIMIT_MM` raised from 32 to 1024 images per prompt
   (= the context window ÷ 1,024 tokens per image). The engine's own
