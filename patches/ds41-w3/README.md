@@ -10,12 +10,12 @@ per rank of weights-side memory at stock-equivalent quality and speed**
 ## Why it matters on this hardware
 
 GB10 is unified-memory: weights-side savings are host-memory savings.
-On the stack this recipe ships without this overlay, a four-fill house
-shape exhausted headroom and the memory guard stopped the lane (the
+On the stack this recipe ships without this overlay, four concurrent deep
+fills exhausted headroom and a watch on free memory stopped the lane (the
 README's memory section). With the overlay armed, the same class of
 shapes rides a materially wider margin — eight concurrent deep fills
-complete end to end. **This kit is what keeps the lane up under load
-instead of being stopped by its own memory guard.**
+complete end to end. **This kit is what keeps the lane up under load, by
+leaving it that margin.**
 
 ## What it changes
 

@@ -31,11 +31,11 @@ transient halves while the solo speed stays).
 the MoE backend and the loader; "the b12x fork" below means this image
 family.)
 
-**Contents** — Quick start · Served numbers · The prefill step budget (the
-memory lever) · The decode-step stack · Transport · The
-six walls · Stack · Configuration · Re-audit triggers · Hardware · Engram ·
-Vision · Speculative decode · Comparison · Upstream's 3-node recipe ·
-Credits · License
+**Contents** — Quick start · Served numbers · The host memory floor and its
+valve · The prefill step budget (the memory lever) · The decode-step stack ·
+Transport · The six walls · Stack · Configuration · Re-audit triggers ·
+Hardware · Engram · Vision · Speculative decode · Comparison · Upstream's
+3-node recipe · Credits · License
 
 **A published vLLM TP3 recipe on a publicly available image — three
 commands to a serving lane, with acceptance gates.** The project that
@@ -87,6 +87,7 @@ Then, from any box that can SSH the other two:
 ```sh
 ./launch/ds41-flash-tp3-up preflight    # image digest + content, checkpoint, fabric
 ./launch/ds41-flash-tp3-up stage-env     # copies cluster.env + launcher + tp3-kit
+# no passwordless sudo? on EVERY box, before start: sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
 ./launch/ds41-flash-tp3-up start --yes   # head first, then workers; API on :8600
 ```
 
@@ -146,11 +147,10 @@ kit):
 | Single-stream decode (counting-task) | **~105 tok/s** (prose-class ~35–40) — carded on the shipped stack |
 | Aggregate decode (counting-task, idle lane) | 1× **~105** · 4× **~270** · 8× **~420** · 16× **~470 tok/s** (prose-class spanning ~65–95 across the ladder; zero preemptions) |
 | Deep-prefill wall (cold ~350K, this hardware class) | **~110 s at the shipped 4096 layer** (the threshold-clipped admission price, +31–41 % over an unclipped fill — the documented trade for ~1 s arrivals); short-prefill rates mid-3K tok/s |
-| Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see the next section; the paired 4096 layer (with the coded expert-scales kit, the shipped default) held worst-moment available memory in a **~0.6–0.8 GiB band** across a four-fill house shape, and eight concurrent deep fills complete end to end; with `DS41_W3=0` the margin is materially thinner — card your own |
+| Host memory under concurrent cold prefills | the transient scales with the **step budget**, not the chunk — see *The prefill step budget is the memory lever*; the paired 4096 layer (with the coded expert-scales kit, the shipped default) held worst-moment available memory in a **~0.6–0.8 GiB band** across a four-fill shape, and eight concurrent deep fills complete end to end; with `DS41_W3=0` the margin is materially thinner — card your own |
 | Arrival TTFT of a NEW short chat beside any deep prefill | **~1 s** (carded 0.93–0.94 s beside a 350K fill; without the threshold the arrival waits the whole prefill). A session resumed with a large cold context additionally pays its own prefill first — roughly 20–30 s per 100K resumed tokens at the published rates |
-| Decode beside a deep prefill | **~15–20 tok/s** per stream with **sub-half-second worst gaps** (carded beside a 400K fill on the shipped stack; no stall class at
-the depths measured) |
-| KV reservation / pool | **~4.8 GiB** → **~5.1M tokens (~4.8× at 1M)** at the shipped 4096 step budget — sized for headroom under load, not for the largest possible figure (see the next section) |
+| Decode beside a deep prefill | **~15–20 tok/s** per stream with **sub-half-second worst gaps** (carded beside a 400K fill on the shipped stack; no stall class at the depths measured) |
+| KV reservation / pool | **~4.8 GiB** → **~5.1M tokens (~4.8× at 1M)** at the shipped 4096 step budget — sized for headroom under load, not for the largest possible figure (see *The prefill step budget is the memory lever*) |
 | Engram drain-sync | deleted by the host-hash kit: ~8% → **~2%** of worker wall-time |
 | Quality | clean across the acceptance gates (FIXLOG 21/22) |
 
@@ -160,6 +160,289 @@ boot gate: stock KV accounting charges every request the worst-case span
 of all its sliding-window groups; the overlay charges each request its
 window+lookahead and the unsettled batches once — which is why the same
 reservation reports a larger pool. FIXLOG failure mode 15.)
+
+## The host memory floor: `vm.min_free_kbytes`
+
+On unified memory the model's ~95 GiB is device memory: it is not counted
+in any process, cannot be reclaimed and cannot be swapped. Everything else
+on the box (the engine's own host-side state, the container runtime, sshd,
+systemd) shares what is left — a dozen GiB or so on this hardware, nearly
+all of it in use once the engine is warm. **`vm.min_free_kbytes` fences off
+the last part of what is left.** It is a watermark, not an allocation: the
+pages stay "free", but ordinary allocations are not allowed below it. The
+reserve exists so that atomic and other high-priority allocations still
+succeed when the box is full — and on this hardware, where there is so
+little left, a generous one costs real capacity.
+
+The reserve is split across zones and becomes each zone's `min` watermark,
+below which normal allocations cannot go. With the reserve set to 1 GiB, a
+head that showed about 1.2 GiB as free had only about 0.2 GiB that an
+ordinary allocation could reach. It sat just above its reserve line while
+ordinary allocations were already failing, and each OOM kill freed almost
+nothing: the memory that showed as "free" was out of reach.
+
+Lowering the reserve to 256 MiB moves that fence down by about three
+quarters of a GiB, and **no more than that**. That is how much further an
+ordinary allocation can go before the kernel refuses it. Almost none of it
+shows as free memory: page cache is reclaimable, so it promptly fills
+whatever the kernel stops holding back and gives way again when something
+needs it. Two readings are easy to misread:
+
+- `MemAvailable` reads far higher afterwards (it jumped by about 2 GiB on
+  one serving boot). That is arithmetic, not memory: the kernel subtracts
+  each zone's `high` watermark from free pages and credits page cache only
+  above the `low` watermark, so lowering the reserve raises the reading on
+  its own. It misleads the other way too — see the note under
+  Hardware, where it reads zero while GiB are free.
+- The free memory sitting above the new fence rose by only a few tens of
+  MiB on that same boot, because page cache took the rest.
+
+To judge what a node can still take, compare `pages free` with `min`;
+never by a `MemAvailable` jump. To read the true margin on a serving box:
+
+```sh
+awk '/^Node 0, zone +Normal/{z=1; next} z && /^Node 0, zone/{exit}
+     z && /pages free/ && !/^ *nr_free/ {f=$3}
+     z && /^ +min +[0-9]/ && !/ratio/ {m=$2}
+     END {if (f == "" || m == "") exit
+          printf "free %d MiB, reserve line %d MiB, above the reserve %d MiB\n",
+                 f*4/1024, m*4/1024, (f-m)*4/1024}' /proc/zoneinfo
+```
+
+It prints nothing if it cannot find the Normal zone. The values in
+`/proc/zoneinfo` are 4 KiB pages on these boxes, and the snippet reads the
+Normal zone, where ordinary allocations live. **"Above the reserve" is how
+much an ordinary allocation can take without waiting for reclaim.** It is
+not a fixed number. The kernel lets page cache fill memory down to its
+`low` watermark, so on a node whose cache is full it sits only a little
+above `min` — roughly an eighth to a quarter of a GiB on these boxes at
+this reserve — and it is higher soon after cache has been dropped; the
+workers on this recipe read well over 1 GiB. A single low reading is not a
+fault.
+
+The failure state is the reading at zero and staying there, with no clean
+file pages left to reclaim: then any request that needs memory can fail to
+allocate. That is how it failed on the node this was measured on: the
+kernel was not swapping (`vm.swappiness` was 0, and the swap devices the
+node has went unused), so it killed processes instead. This recipe does not
+set swappiness. With swapping enabled the same squeeze is expected to show
+up as stalls first; that posture has not been measured, and neither has the
+valve below in it.
+
+Page cache takes three numbers, all in `/proc/meminfo`, and no arithmetic
+on them says exactly what a drop will recover:
+
+```sh
+awk -F: '$1=="Active(file)" {af=$2} $1=="Inactive(file)" {i=$2} $1=="Shmem" {s=$2} $1=="Mapped" {m=$2}
+     END {if (af == "" || i == "" || s == "" || m == "") exit
+          printf "clean file pages %d MiB, mapped in total %d MiB, shared memory %d MiB\n",
+                 (af+i)/1024, m/1024, s/1024}' /proc/meminfo
+```
+
+- **Clean file pages** (`Active(file)` + `Inactive(file)`) are copies of
+  data that exists on disk. The kernel can reclaim every one of them.
+- **Shared memory** (`Shmem`) exists only in memory. It is not in the
+  file-page figures at all — it is swap-backed and sits on the anonymous
+  lists — so nothing but swap reclaims it.
+- **Mapped** counts the pages processes have mapped into their address
+  spaces, file pages and shared memory together. A *drop* cannot evict a
+  file page that a process has mapped — a shared library in use, for
+  example — though the kernel still reclaims it under pressure. The kernel
+  does not say how much of `Mapped` is file pages, which is why the amount
+  a drop will free cannot be computed from these three.
+
+So read the margin together with the first number, knowing that a drop may
+free only a small part of it. An upper bound on what a drop can free is the
+file pages minus (`Mapped` − shared memory), which is the least that can be
+mapped file pages. With the valve running, that came to about 70–110 MiB on
+the node measured, and drops gave back tens of MiB each — about 60 in the
+one measured this way. A margin that is low while the node holds GiB of
+clean file pages is not the failure state; it is holding a cushion it is
+not using, and the part a drop can free is the unmapped part. The kernel
+reclaims that cache only when an allocation presses against the watermark,
+so each request that needs memory pays the reclaim itself, under pressure,
+and there is no room for a burst. On this recipe the node that runs the API
+server lives there: it carries the API server and the engine core on top of
+its own model rank, about 1.5–2 GiB more host memory than the others. Under
+ordinary chat traffic it was reading a few dozen MiB above the reserve
+while holding about 1.8 GiB a drop could free, accumulated over a day. One
+drop — made by hand, before the valve existed — took the margin from about
+0.1 GiB to about 1.8 GiB with the lane serving. What accumulates in that
+cache is ordinary file output — logs and telemetry — not model data: with
+`LOAD_FORMAT=b12x` the loader and the memory-table reader open their files
+`O_DIRECT` (the conservative safetensors fallback does go through the page
+cache), and the engine's own shared segments are shared memory.
+
+A reserve is too high when it fences off most of what the node has left,
+as 1 GiB did on the head above. `pages free` sitting close to `min` is not
+by itself that sign, since it happens at any setting once the cache is
+full. Every available-memory figure elsewhere in this recipe was read with
+the reserve at 1 GiB. The reserve is read with `sysctl vm.min_free_kbytes`
+and lowered live with `sudo sysctl -w vm.min_free_kbytes=262144`; it does
+not survive a reboot unless a file under `/etc/sysctl.d/` also sets it,
+and when two do, the later file name wins. Raising it again is one command
+too, but do that with the lane idle: a higher reserve fences off memory
+that a loaded node is already using. The 1 GiB the nodes this was measured
+on ran with was not a kernel default — the kernel's own default on this
+hardware class is a few tens of MiB. The valve below was measured with the reserve at
+256 MiB — on an idle lane and under ordinary chat traffic, not under a deep
+fill, and not through a boot.
+
+Any test or gate with an abort floor on free memory needs re-basing: it
+reads about three quarters of a GiB lower at 256 MiB whenever memory is
+pressed down to the fence. The launcher's boot probe does not. During the
+load it samples `MemFree + SReclaimable + file pages − Unevictable` — a
+total the reserve does not change, since it counts the free pages and the
+cache together — and when the container exits (or after 45 minutes) prints
+one advisory line, `HEADROOM GATE`, comparing its lowest sample with a
+fixed line of about 1.9 GiB. Nothing acts on that verdict. On its last run
+the lowest sample came in at a little more than twice that line. It is a
+different quantity from the margin above — larger, and shared memory is no
+part of it — so read it as a check on the load, not as the node's margin
+afterwards.
+
+### A valve that keeps the margin
+
+When the cause is clean file cache, the state above needs no restart and
+no setting: dropping it returns the margin at once.
+`tools/mem-floor-valve.sh` does that automatically, so the margin does not
+settle there. Every 10 s it reads the margin. Under 1,000 MiB, it asks the
+kernel to drop clean cache and reads the margin again. It does not try to
+predict what a drop will recover — the kernel does not report that. After
+a drop that gives back less than 128 MiB it doubles the wait before the
+next one, from 30 s up to 10 minutes; after one that gives back more, the
+next follows as soon as 30 s later. A node whose margin is held by its
+processes, not by cache, therefore sees at most one drop every ten
+minutes, and every attempt says in the log what it gave back.
+
+Leaving it running beside the engine was measured — in one installation,
+on a node that was not swapping (`vm.swappiness=0`). A drop cannot reach
+the model: the weights are in device memory, with `LOAD_FORMAT=b12x` the
+loader and the table reader bypass the page cache, and the engine's shared
+segments are shared memory. In one controlled drop — about 1 GiB of file
+data read into the cache first, then dropped, with requests sent immediately
+afterwards — the engine's processes took no major page faults
+from the drop itself and a single 4 KiB page over the requests that
+followed, and a 200-token generation took roughly the same time before and
+after (within about ten percent, the size of the run-to-run spread). On a
+node that swaps, treat the valve as unmeasured. Three rules keep it from
+doing harm:
+
+- **It never drops blind.** A margin it cannot read waits — and the valve
+  says so, once, in its log.
+- **It says what happened.** When a drop gives back little it writes `LOW`
+  to its log and waits longer. It cannot create memory: a margin held by
+  what the processes themselves have is not something a drop gives back.
+- **It does not trip on a healthy node.** With the margin at or over the
+  floor it does nothing.
+
+What it did on the node it was measured on: the margin had sat at a few
+dozen MiB above the reserve; with the valve it held about 1.1–1.6 GiB when
+idle, and under a burst of test requests it stayed above about 0.5 GiB.
+The idle figure fell over one evening, from about 1.6 to about 1.1 GiB, as
+the engine kept memory from real traffic — which a drop does not return.
+Two limits: the floor was chosen against the idle margin and is not tuned
+beyond that, and the valve has not been measured under a deep fill or
+through a boot.
+
+Install it on the node that runs the API server, as the user that runs the
+engine, from a checkout of this recipe (the launcher does not stage
+`tools/`):
+
+```sh
+# the helper: root-owned. The sudoers rule below lets sudo run exactly this, nothing else.
+sudo install -o root -g root -m 0755 tools/vm-drop-caches /usr/local/sbin/vm-drop-caches
+f="$(mktemp)"          # a private file: under a predictable name in /tmp another user could swap it
+printf '%s ALL=(root) NOPASSWD: /usr/local/sbin/vm-drop-caches\n' "$USER" > "$f"
+sudo visudo -cf "$f" &&
+  sudo install -o root -g root -m 0440 "$f" /etc/sudoers.d/ds41-vm-drop-caches
+rm -f "$f"
+
+# the valve: a user unit
+mkdir -p ~/.local/lib/ds41 ~/.config/systemd/user
+install -m 0755 tools/mem-floor-valve.sh ~/.local/lib/ds41/
+install -m 0644 tools/mem-floor-valve.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now mem-floor-valve.service
+
+# a user's units stop when that user's last login ends, unless lingering is
+# on: without this the valve dies the moment you log out
+sudo loginctl enable-linger "$USER"
+```
+
+That rule covers the valve only. Both launchers try to drop the page cache
+themselves before the load, and neither asks for the helper's command:
+
+- `ds41-flash-tp3-up start` runs, on every box, `sudo -n sh -c 'echo 3 >
+  /proc/sys/vm/drop_caches'` — with no `sync` — and prints `WARN: could not
+  drop the page cache (passwordless sudo required)` on your terminal when
+  it cannot.
+- The per-box launcher it starts then runs `sudo -n sh -c 'sync; echo 3 >
+  /proc/sys/vm/drop_caches'`, and when that fails writes `drop_caches
+  SKIPPED` into `/tmp/ds41-boot-head.log`, `…-w1.log` and `…-w2.log` on the
+  boxes.
+
+sudo matches a command string exactly, so a rule for one of them does not
+cover the other, and neither is covered by the helper's rule. Without
+passwordless sudo for those commands the launchers go on booting, so drop
+the cache yourself first: on every box, before `ds41-flash-tp3-up start`,
+run `sudo sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'`.
+
+To verify it:
+
+```sh
+sudo -n -l /usr/local/sbin/vm-drop-caches      # must list the helper: the grant took
+~/.local/lib/ds41/mem-floor-valve.sh --status
+#   true headroom 1300 MiB (floor 1000); clean file pages 940 MiB, mapped in total 1690 MiB, shared memory 820 MiB -> WAIT:headroom-ok
+systemctl --user is-active mem-floor-valve.service
+tail -3 ~/.local/state/ds41/mem-floor.log
+```
+
+`--status` prints one reading and what a valve whose wait is open would
+decide; it does not know when the running valve last dropped. In the log,
+every attempt is a `TRY` line, written before the drop, then a `RECLAIM`
+line saying what it gave back — and, when that was little, a `LOW` line. A
+helper that fails writes `RECLAIM FAILED`, carrying the
+helper's exit code and the first line of its error output, and the valve
+then waits as it does after a poor drop: after fixing a missing grant,
+restart the unit, or wait up to ten minutes for the next try.
+`mem-floor.csv` beside the log holds every reading (about half a megabyte a
+day); nothing rotates either file. The settings are environment variables
+listed at the top of the script. To change the floor, add a drop-in and
+restart the unit — a drop-in takes effect only then, and it needs its own
+section header:
+
+```sh
+systemctl --user edit mem-floor-valve.service
+# in the editor, enter exactly these two lines, save, and close:
+#   [Service]
+#   Environment=FLOOR_MIB=1500
+systemctl --user restart mem-floor-valve.service
+```
+
+Three things can stop the valve, and each shows in one place. If it cannot
+create its state directory, or cannot write its log — at start or later —
+or cannot write its CSV at start, it stops at once with the reason on its
+standard error; `systemctl --user status mem-floor-valve.service` shows it.
+After five starts in five minutes the unit gives up: fix the cause, then
+`systemctl --user reset-failed mem-floor-valve.service` and start it again.
+(A CSV that becomes unwritable later costs only the curve: the valve keeps
+going and says so once in its log.) If the helper never returns,
+the readings stop with it, and the log ends with a `TRY` line that has no
+result; `systemctl --user restart mem-floor-valve.service` resumes it. If
+the margin cannot be read at all, nothing is dropped, and the log gets one
+`UNREADABLE` line — and a `READABLE` line once it can be read again.
+
+To remove the valve: `systemctl --user disable --now
+mem-floor-valve.service`, then delete
+`~/.config/systemd/user/mem-floor-valve.service`, the drop-in directory if
+you made one (`~/.config/systemd/user/mem-floor-valve.service.d/`) and
+`~/.local/lib/ds41/`, run `systemctl --user daemon-reload`, and delete
+`~/.local/state/ds41/`. If nothing else on the node needs them, also run
+`sudo loginctl disable-linger "$USER"`, and remove the sudoers rule
+(`/etc/sudoers.d/ds41-vm-drop-caches`) and the helper
+(`/usr/local/sbin/vm-drop-caches`). The desk test needs no box and no
+privileges — `bash tools/test-mem-floor-valve.sh` — and is safe to run on a
+serving node.
 
 ## The prefill step budget is the memory lever
 
@@ -190,13 +473,13 @@ armed (`patches/ds41-w3/` — shipped, and ON by default since v1.7.0),
 eight concurrent deep fills — the sequence cap saturated — complete end
 to end without approaching the kernel-OOM line, and a maximum-context
 request keeps interactive decode beside them at sub-second gaps.** With
-`DS41_W3=0` (stock kernel files), the margin is materially thinner: a
-four-fill house shape exhausted headroom and the memory guard stopped
-the lane. This recipe does not chase the envelope: the pool is sized so
+`DS41_W3=0` (stock kernel files), the margin is materially thinner: four
+concurrent deep fills exhausted headroom, and a watch on free memory
+stopped the lane. This recipe does not chase the envelope: the pool is sized so
 the box has room to stay interactive. Pushing the reservation higher
 buys little usable capacity, because the fill-time memory trough is
 what binds on this stack, not pool occupancy (FIXLOG 20). Card your own
-margin with the fill probe before promising co-tenants anything; the
+margin with a fill test of your own before promising co-tenants anything; the
 conservative 2048 fallback halves the transient and buys the margin
 back either way. Deep-fill walls at the 4096 step pay the documented
 threshold class (+31–41 %), and long-context retrieval was re-verified
@@ -299,9 +582,10 @@ unconditionally safe).
 ### 4. The startup free-memory check
 
 The fork checks available GPU memory at startup against gmu × total; a
-busy head node fails the 0.92 default. gmu 0.85 ships, and the launcher
-drops the page cache before every boot (best-effort, passwordless sudo;
-manually: `sync; echo 3 > /proc/sys/vm/drop_caches`).
+busy head node fails the 0.92 default. gmu 0.85 ships, and both launchers
+try to drop the page cache before the load. That is best-effort — it needs
+passwordless sudo for the command — and what to do without it is under
+*A valve that keeps the margin*.
 
 ### 5. Vocabulary divisibility at TP3
 
@@ -354,7 +638,9 @@ SPEC_CFG='{"method":"dspark","num_speculative_tokens":5,"draft_tensor_parallel_s
 PAR_PREFILLS=1                     # serialized prefills keep decode batches pure (FIXLOG 19)
 PREFILL_COMPUTE_SHARE=0.2          # decode-under-prefill share (FIXLOG 16)
 PREFILL_TOKENS_PER_STEP=4096       # the shipped deep-prefill layer (paired)
-EXTRA_SERVE_ARGS='--long-prefill-token-threshold 1024'   # ~1 s arrivals (FIXLOG 21)
+EXTRA_SERVE_ARGS='--long-prefill-token-threshold 1024 --mm-processor-cache-gb 0.5'
+                                   # ~1 s arrivals (FIXLOG 21); the host image cache
+                                   # bounded at 0.5 GiB/process (FIXLOG 34)
 B12X_AUTOTUNE=0                    # heuristic cubin plans; see the decode-stack section
 
 MAX_NUM_SEQS=8                     # 16 extends the serving aggregate ladder
@@ -395,6 +681,12 @@ the metric label.
 **Concurrency figures are pool depth**, not simultaneous streams:
 `MAX_NUM_SEQS` caps live sequences; the ~4.8× figure describes how
 many full-length requests fit the pool.
+
+Three settings that matter as much are not in this file, because they
+belong to the nodes rather than to the launch: the memory reserve
+(`vm.min_free_kbytes`, at 256 MiB when the valve's floor was measured), the
+valve that keeps the margin above it, and `vm.swappiness` — see **The host
+memory floor**.
 
 ## Re-audit triggers
 
@@ -437,8 +729,9 @@ This table is arithmetic, not a measurement — once the weights are
 resident, the measured free memory on a loaded box can sit far below it
 and moves with the page cache: observed readings range from tens of MiB
 to a few GiB, and loads have been OOM-killed at the low end. Treat
-headroom as a budget to measure: the launcher drops page cache before
-the load, and its boot probe samples the minimum **reclaimable**
+headroom as a budget to measure: the launchers try to drop page cache
+before the load (*The startup free-memory check*), and the boot probe
+samples the minimum **reclaimable**
 headroom across the whole boot and prints it (`MemAvailable` alone can
 read zero on this unified-memory kernel even when memory is available).
 If a boot is killed, the kernel log says so (`journalctl -k | grep -i
@@ -484,6 +777,20 @@ vision requests emit a short run of invisible completion tokens before
 the answer — give `max_tokens ≥ ~200`; and per-image identification stays
 strong at the limit while aggregate counting drifts (a 32-image batch
 counted as 30).
+
+**A second host-memory cost: the image cache.** The engine also keeps a
+host-side cache of processed images, keyed by the image's content, so the
+same image is not processed twice. It is not tied to a conversation:
+compacting or ending a chat does not free it; an entry leaves when newer
+images push it out or the process restarts. The cache defaults to **4 GiB
+per process**, on both the API server and the engine core — up to 8 GiB of
+host memory on the node that has the least to spare. The shipped default
+caps it at **0.5 GiB per process** (`--mm-processor-cache-gb 0.5` in
+`EXTRA_SERVE_ARGS`), bounding the cache at 1 GiB on the node. How many
+images that holds depends on their resolution; an image too large for the
+cache is processed without caching, never refused. The cost of the cap is
+that an identical image re-sent after it has been evicted is processed
+again instead of served from the cache.
 
 ## Speculative decode: the shipped default and the depth dial
 
@@ -673,6 +980,23 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.13.0 — the host image cache is bounded; the memory floor
+  is documented, and a valve keeps the margin)** — three changes that come
+  from one failure and its aftermath. The engine's host-side image cache
+  defaults to 4 GiB per process on two processes (an 8 GiB ceiling); the
+  shipped default now caps it at 0.5 GiB per process
+  (`--mm-processor-cache-gb 0.5`, FIXLOG 34), bounding the cache at 1 GiB
+  on the node; an image too large for the cache is processed uncached
+  rather than refused. A new section, **The host memory floor**, explains
+  why a large `vm.min_free_kbytes` costs real capacity on unified memory:
+  the model's device memory cannot be reclaimed, and the reserve is a
+  watermark that fences off part of the little the host has left. It also
+  records how little lowering the reserve really buys, why `MemAvailable`
+  cannot be used to judge it (FIXLOG 35), and how to read the true margin.
+  And the node that runs the API server was found sitting a few dozen MiB
+  above its reserve while about 1.8 GiB of what it held was clean file
+  cache it did not need: `tools/mem-floor-valve.sh` now drops that cache automatically
+  and keeps the margin up (FIXLOG 36).
 - **2026-11 (v1.12.0 — capacity out of the headline)** — a framing
   cleanup, no number or default changed: the recipe had drifted back to
   leading with pool size and the eight-concurrent-deep-fill result. The
@@ -726,7 +1050,7 @@ same gate asserts).
   carding fill on the shipped stack found the concurrent deep-fill
   ceiling claims needed scoping — the envelope-class receipts belong to
   the coded-expert-scales kit, and the pre-kit shipped stack's four-fill shape
-  exhausted headroom (the memory guard stopped the lane, as designed).
+  exhausted headroom (a watch on free memory stopped the lane, as designed).
 - **2026-11 (v1.5.0 — the reconciliation + first true carding)** — the
   best-found levers shipped: the paired 4096 layer promoted to the
   shipped default and FP8 attention internals folded in (with the

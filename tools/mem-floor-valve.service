@@ -1,0 +1,40 @@
+# Page-cache valve for the node that runs the API server — see "A valve that
+# keeps the margin" in the README. Install it for the user that runs the
+# engine, as that user:
+#
+#   mkdir -p ~/.local/lib/ds41 ~/.config/systemd/user
+#   install -m 0755 tools/mem-floor-valve.sh ~/.local/lib/ds41/
+#   install -m 0644 tools/mem-floor-valve.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now mem-floor-valve.service
+#
+# A user's units stop when that user's last login ends, unless lingering is
+# on for the user — without this the valve dies the moment you log out:
+#
+#   sudo loginctl enable-linger "$USER"
+#
+# Change the floor with a drop-in, not by editing the installed unit, and
+# restart the unit afterwards. A drop-in needs its own section header, or
+# systemd ignores the line:
+#
+#   systemctl --user edit mem-floor-valve.service
+#   [Service]
+#   Environment=FLOOR_MIB=1500
+[Unit]
+Description=Page-cache valve: drops clean file cache to keep host memory margin (never touches the engine)
+After=default.target
+# A valve that cannot start (a setting that is not a number) exits at once;
+# stop retrying it after a few tries rather than every 15 s forever.
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/bin/bash %h/.local/lib/ds41/mem-floor-valve.sh
+Restart=always
+RestartSec=15
+# The floor is in MiB of true headroom (Normal zone pages free − min).
+Environment=FLOOR_MIB=1000
+
+[Install]
+WantedBy=default.target

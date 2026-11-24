@@ -1,0 +1,29 @@
+#!/bin/sh
+# vm-drop-caches — drop clean file cache and reclaimable slab, nothing else.
+#
+# The command the README gives for the pre-boot drop, wrapped so sudo can
+# grant exactly this and nothing else:
+#
+#     sync; echo 3 > /proc/sys/vm/drop_caches
+#
+# What it frees: page cache for files (clean copies of data that exists on
+# disk) and reclaimable slab objects (directory and inode caches). `sync`
+# runs first, so pages still being written are flushed and become clean.
+#
+# What it never touches: any process's own memory, shared memory, and device
+# memory. On this hardware the model's weights live in device memory once
+# loaded, and with this recipe's load format (`LOAD_FORMAT=b12x`) both the
+# loader and the memory-table reader open their files O_DIRECT, so the
+# model's data does not pass through the page cache at all.
+#
+# Root only: writing /proc/sys/vm/drop_caches requires it. Install it
+# root-owned and not writable by anyone else — a sudoers rule points here:
+#
+#   sudo install -o root -g root -m 0755 tools/vm-drop-caches /usr/local/sbin/vm-drop-caches
+set -eu
+
+[ "$#" -eq 0 ] || { echo "usage: vm-drop-caches (takes no arguments)" >&2; exit 2; }
+[ "$(id -u)" -eq 0 ] || { echo "vm-drop-caches: must run as root (use sudo)" >&2; exit 1; }
+
+sync
+printf '3\n' > /proc/sys/vm/drop_caches
