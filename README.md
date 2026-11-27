@@ -315,6 +315,14 @@ next follows as soon as 30 s later. A node whose margin is held by its
 processes, not by cache, therefore sees at most one drop every ten
 minutes, and every attempt says in the log what it gave back.
 
+One exception, at the lowest margins: under 300 MiB of true headroom that
+wait does not grow. The next try follows 30 s later however many poor drops
+came before it, because a drop there can give back far more than the ones
+before it, and waiting is then the costlier error. A try that fails brings
+the longer wait back at once. `NO_THROTTLE_MIB=0` turns the exception off. It
+is a drop every 30 s for as long as the margin stays that low; the cost of a
+drop measured below is of single drops, not of a long run of them.
+
 Leaving it running beside the engine was measured — in one installation,
 on a node that was not swapping (`vm.swappiness=0`). A drop cannot reach
 the model: the weights are in device memory, with `LOAD_FORMAT=b12x` the
@@ -331,7 +339,8 @@ doing harm:
 - **It never drops blind.** A margin it cannot read waits — and the valve
   says so, once, in its log.
 - **It says what happened.** When a drop gives back little it writes `LOW`
-  to its log and waits longer. It cannot create memory: a margin held by
+  to its log and waits longer — except under 300 MiB, where it keeps trying
+  at the minimum wait. It cannot create memory: a margin held by
   what the processes themselves have is not something a drop gives back.
 - **It does not trip on a healthy node.** With the margin at or over the
   floor it does nothing.
@@ -812,7 +821,23 @@ it:
   pool size tried. Kernel-side draft levers moved 8-stream only a few
   percent; per-batch depths + serialization compose but drop the
   deep-prefill trough under the floor, so the shipped profile is the
-  plain k=5 drafter with one serialized prefill.
+  plain k=5 drafter with one serialized prefill. Re-read on a k=3,
+  twelve-sequence posture that also ran a scheduler kit this recipe does
+  not ship (one of its clauses clips the deep-prefill chunk to 2,048
+  tokens a step), as the one field `enable_adaptive_verification` in
+  `SPEC_CFG`, both ways in one window: about a tenth more aggregate at
+  eight streams, a touch lower at one and four (inside the run's own
+  scatter); warm deep-prefill walls and the gaps between tokens during a
+  fill unchanged; draft acceptance a few percent lower; quality gates
+  clean. With the field on, the engram host-hash kit declines spec steps,
+  so the reading includes that fallback. It still costs memory: on four
+  concurrent deep prefills the node's available memory bottoms about half
+  a GiB lower than on boots without it, the same shape in other windows.
+  Its known hazard — the workspace holding memory after idle — did not
+  show in one reading: after ten idle minutes on that boot the true
+  headroom still read about 1 GiB; that was read once, not through a long
+  session. A gain that shows only at eight streams does not justify that
+  on a long-lived node.
 
 **The depth dial, measured at the full pool (v1.8.0)** — `k` trades the
 counting class against concurrent prose, and both ends are receipted on
@@ -980,6 +1005,28 @@ same gate asserts).
 
 ## Changelog
 
+- **2026-11 (v1.14.0 — the valve keeps trying at the lowest margins)** —
+  one change, to `tools/mem-floor-valve.sh`. Its back-off — the wait that
+  doubles after each drop that gives back little — is for a node whose
+  margin is held by its processes, where another drop cannot help. On a
+  long-lived node it cut the other way: nearly every drop was poor, so
+  the wait soon sat at its ten-minute cap. In that run the margin fell
+  under a third of a GiB on each of three nights, every time inside the
+  wait. Of the tries made from under the line — three — the first gave
+  back almost nothing, the next two many times the typical drop; in two
+  stretches none was made before the stretch ended. Under
+  `NO_THROTTLE_MIB` (300 MiB of true headroom; `0` turns it off) the wait
+  now stays at the minimum, 30 s, whatever went before. The streak keeps
+  counting behind it and applies again above the line, and a try that
+  fails brings the back-off back at once. The log states the wait in
+  force and the condition it holds under; the start line states the
+  setting. The desk test covers the decision and, with its clock
+  replaced, the loop (FIXLOG 37). The same release trues two notes to new
+  receipts: the attention-compute comment in `config/cluster.env` no
+  longer credits the setting with a prose gain that was not reproduced on
+  a k=3 posture, or a counting gain that was not re-measured (FIXLOG 38),
+  and the adaptive-verifier note carries its k=3 reading — about a tenth
+  at eight streams, a touch lower at one and four.
 - **2026-11 (v1.13.0 — the host image cache is bounded; the memory floor
   is documented, and a valve keeps the margin)** — three changes that come
   from one failure and its aftermath. The engine's host-side image cache
@@ -1054,7 +1101,8 @@ same gate asserts).
 - **2026-11 (v1.5.0 — the reconciliation + first true carding)** — the
   best-found levers shipped: the paired 4096 layer promoted to the
   shipped default and FP8 attention internals folded in (with the
-  launcher forward it had been missing); every published number re-carded
+  launcher forward it had been missing; its measured note is corrected in
+  v1.14.0); every published number re-carded
   ON the shipped configuration (single-stream ~105 counting-class,
   c16 ~470); two shipped-since-the-start defects found and fixed by the
   carding boot itself (FIXLOG 29–30).
