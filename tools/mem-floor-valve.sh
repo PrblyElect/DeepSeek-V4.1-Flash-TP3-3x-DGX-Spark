@@ -30,20 +30,14 @@
 # A drop that recovers little is thus repeated at most once per MAX_GAP, and
 # one that recovers a useful amount is followed by the next as soon as
 # MIN_GAP later.
-# That back-off is lifted under NO_THROTTLE_MIB: there the wait stays MIN_GAP
-# whatever the streak, because at that margin a drop can still give back far
-# more than the ones before it — until a try FAILS, which brings the back-off
-# back. 0 turns the lift off.
 #
 # WHAT IT DOES NOT DO
 # It never stops, starts, signals or inspects the engine's container; its only
 # privileged act is one call to a helper that drops clean cache. It never
 # drops on a margin it could not read. It cannot create memory: when the
 # margin is low because of what the processes themselves hold, a drop
-# recovers little, and the valve says so in its log and waits longer — unless
-# the margin is under NO_THROTTLE_MIB, where it keeps trying at the minimum
-# wait. And it does nothing it cannot record: it stops rather than run without
-# its log.
+# recovers little, and the valve says so in its log and waits longer. And it
+# does nothing it cannot record: it stops rather than run without its log.
 #
 # Settings (environment variables; the defaults are the shipped values):
 #   FLOOR_MIB=1000                          drop below this much true headroom
@@ -53,9 +47,6 @@
 #   MAX_GAP=600                             the wait doubles after each drop that
 #                                           recovered less, up to this
 #   MIN_DROPPABLE_MIB=128                   what a drop must recover to count
-#   NO_THROTTLE_MIB=300                     under this much true headroom the back-off
-#                                           does not apply: the wait is MIN_GAP whatever
-#                                           the streak, until a try fails. 0 turns it off.
 #   RECLAIM=/usr/local/sbin/vm-drop-caches  the helper (tools/vm-drop-caches)
 #   STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/ds41
 #                                           mem-floor.log and mem-floor.csv
@@ -71,7 +62,6 @@ INTERVAL="${INTERVAL:-10}"
 MIN_GAP="${MIN_GAP:-30}"
 MAX_GAP="${MAX_GAP:-600}"
 MIN_DROPPABLE_MIB="${MIN_DROPPABLE_MIB:-128}"
-NO_THROTTLE_MIB="${NO_THROTTLE_MIB:-300}"
 RECLAIM="${RECLAIM:-/usr/local/sbin/vm-drop-caches}"
 # XDG_STATE_HOME counts only when it is an absolute path.
 case "${XDG_STATE_HOME:-}" in
@@ -106,8 +96,7 @@ meminfo_mib() {         # one key of /proc/meminfo, in MiB
 
 # ---- the decision: pure functions (tools/test-mem-floor-valve.sh imports them)
 # valve_decide $1 headroom_mib  $2 seconds since the last drop  $3 the streak
-#   (consecutive drops that recovered less than MIN_DROPPABLE_MIB)
-#   $4 optional, 1 when the last try FAILED.
+#   (consecutive drops that recovered less than MIN_DROPPABLE_MIB).
 # Prints DROP, or WAIT:<reason>. Nothing unreadable ever drops.
 valve_decide() {
   local hr="$1" since="$2" streak="$3" gap
@@ -120,9 +109,8 @@ valve_decide() {
   case "$since" in ''|*[!0-9]*) echo "WAIT:throttled"; return ;; esac
   case "$streak" in ''|*[!0-9]*) streak=0 ;; esac
   # A gap that is not a whole number waits: an errored comparison reads as
-  # false, which is a DROP. The gap is valve_wait's for this margin: the
-  # streak's, or the minimum where the back-off is lifted.
-  gap="$(valve_wait "$hr" "$streak" "${4:-0}")"
+  # false, which is a DROP.
+  gap="$(valve_gap "$streak")"
   case "$gap" in ''|*[!0-9]*) echo "WAIT:throttled"; return ;; esac
   if [ "$since" -lt "$gap" ]; then echo "WAIT:throttled"; return; fi
   echo "DROP"
@@ -138,38 +126,6 @@ valve_gap() {           # $1 the streak -> the wait before the next drop, in sec
   case "$1" in ''|*[!0-9]*) set -- 0 ;; esac      # an unreadable streak waits the minimum
   while [ "$i" -lt "$1" ] && [ "$gap" -lt "$cap" ]; do gap=$(( gap * 2 )); i=$(( i + 1 )); done
   if [ "$gap" -gt "$cap" ]; then gap="$cap"; fi
-  printf '%s' "$gap"
-}
-# The back-off (valve_gap: the wait doubles per poor drop) keeps a drop that
-# gives back little from being repeated often. Its cost: after a run of poor
-# drops the valve waits out its longest gap at the very margins where a drop
-# still gives back the most. Under NO_THROTTLE_MIB that back-off is lifted.
-# valve_lifted $1 headroom_mib -> status 0 where the back-off is lifted at
-# this margin: NO_THROTTLE_MIB above 0, and the margin under it. Anything
-# unreadable, the margin included, is never lifted.
-valve_lifted() {
-  case "${NO_THROTTLE_MIB:-}" in ''|*[!0-9]*|??????????*) return 1 ;; esac
-  case "${1#-}" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$((10#$NO_THROTTLE_MIB))" -gt 0 ] && [ "$1" -lt "$((10#$NO_THROTTLE_MIB))" ]
-}
-# valve_wait $1 headroom_mib  $2 the streak  $3 1 when the last try FAILED
-#   -> the wait before the next drop, in seconds; EMPTY if it cannot be told.
-#   One function for the decision and for the log, so that the log states the
-#   wait the decision enforces — and, where that depends on which side of the
-#   line the NEXT margin falls, says so (the loop writes both). Where the
-#   back-off is lifted the wait is the minimum whatever the streak; a drop is
-#   thus still at most one per
-#   MIN_GAP, and the streak keeps counting — it applies again as soon as the
-#   margin rises above NO_THROTTLE_MIB. After a failed try the back-off is
-#   never lifted: a helper that is missing or not granted must not be retried
-#   every MIN_GAP.
-valve_wait() {
-  local gap; gap="$(valve_gap "$2")"
-  case "$gap" in ''|*[!0-9]*) return ;; esac
-  if [ "${3:-0}" != 1 ] && valve_lifted "$1"; then
-    gap="$(valve_gap 0)"                # never the raw setting: the same checks as above
-    case "$gap" in ''|*[!0-9]*) return ;; esac
-  fi
   printf '%s' "$gap"
 }
 valve_recovered() {     # $1 headroom before a drop  $2 after -> the difference; EMPTY if either is unreadable
@@ -218,18 +174,15 @@ valve_loop() {
       || die_state "cannot write its CSV"
   fi
   [ -w "$CSV" ] || die_state "cannot write its CSV"
-  local last_drop=0 streak=0 try_failed=0 now hr before after recovered err rc gap decision row avail free
-  local fp sh mem unreadable=0 csv_said=0 since_desc lift_desc gap_desc low_desc lift_note
-  # The back-off line as set: a positive value is named; 0 says it is off.
-  lift_note="no back-off under ${NO_THROTTLE_MIB} MiB"
-  if ! valve_lifted 0; then lift_note="the back-off lifted nowhere"; fi     # 0, or not a number: the lift is off
+  local last_drop=0 streak=0 now hr before after recovered err rc gap decision row avail free
+  local fp sh mem unreadable=0 csv_said=0 since_desc
   # The start line is the first real write to the log: a log that cannot be
   # written stops the valve here.
-  must_log "mem-floor-valve started (true-headroom floor ${FLOOR_MIB} MiB, interval ${INTERVAL}s, min gap ${MIN_GAP}s, max gap ${MAX_GAP}s, a drop that recovers less than ${MIN_DROPPABLE_MIB} MiB doubles the wait, ${lift_note}, reclaim=${RECLAIM})"
+  must_log "mem-floor-valve started (true-headroom floor ${FLOOR_MIB} MiB, interval ${INTERVAL}s, min gap ${MIN_GAP}s, max gap ${MAX_GAP}s, a drop that recovers less than ${MIN_DROPPABLE_MIB} MiB doubles the wait, reclaim=${RECLAIM})"
   while :; do
     now=$(date +%s)
     hr="$(zone_headroom_mib)"
-    decision="$(valve_decide "$hr" "$(( now - last_drop ))" "$streak" "$try_failed")"
+    decision="$(valve_decide "$hr" "$(( now - last_drop ))" "$streak")"
     # The remaining columns describe the cache for reading the curve afterwards.
     set -- $(cache_mib); fp="${1:-}"; sh="${2:-}"; mem="${3:-}"
     avail="$(meminfo_mib MemAvailable)"; free="$(meminfo_mib MemFree)"
@@ -251,10 +204,7 @@ valve_loop() {
       # Recorded before the act, so that a helper which hangs leaves a trace.
       since_desc=""
       if [ "$last_drop" -gt 0 ]; then since_desc=" ($(( now - last_drop )) s since the last drop)"; fi
-      # Said where it is in force, so the back-off's absence is on record too.
-      lift_desc=""
-      if [ "$try_failed" != 1 ] && valve_lifted "$hr"; then lift_desc=" (no back-off under ${NO_THROTTLE_MIB} MiB)"; fi
-      must_log "TRY: true headroom ${hr:-?} MiB < floor ${FLOOR_MIB} MiB; dropping clean cache${since_desc}${lift_desc}"
+      must_log "TRY: true headroom ${hr:-?} MiB < floor ${FLOOR_MIB} MiB; dropping clean cache${since_desc}"
       before="$hr"
       err="$(valve_reclaim 2>&1 >/dev/null)"; rc=$?
       err="${err%%$'\n'*}"                      # its first line only
@@ -262,49 +212,23 @@ valve_loop() {
       after="$(zone_headroom_mib)"
       last_drop=$now
       if [ "$rc" -eq 0 ]; then
-        try_failed=0
         recovered="$(valve_recovered "$before" "$after")"
         streak="$(valve_next_streak "$recovered" "$streak")"
-        gap="$(valve_wait "$after" "$streak" 0)"
-        # Which wait the next decision enforces depends on the NEXT reading's
-        # margin, not on this one's. So a result line never states one wait as
-        # if it held everywhere: under the line, it says the wait holds only
-        # while the margin stays there; above it, where the wait is longer, it
-        # names the minimum that applies once the margin falls under the line.
-        gap_desc=""; low_desc=""
-        if [ -n "$gap" ]; then
-          if valve_lifted "$after"; then
-            gap_desc=" while the margin stays under ${NO_THROTTLE_MIB} MiB"
-          elif valve_lifted 0 && [ "$gap" != "$(valve_gap 0)" ]; then      # the lift is on, and the waits differ
-            gap_desc=", or $(valve_gap 0) s once the margin is under ${NO_THROTTLE_MIB} MiB"
-            low_desc=" — the minimum, $(valve_gap 0) s, once the margin is under ${NO_THROTTLE_MIB} MiB"
-          fi
-        fi
-        must_log "RECLAIM: true headroom ${before:-?} MiB < floor ${FLOOR_MIB} MiB -> dropped clean cache -> headroom ${after:-?} MiB (recovered ${recovered:-an unreadable amount} MiB; file pages ${fp:-?} MiB, shared memory ${sh:-?} MiB, mapped ${mem:-?} MiB; next drop allowed in ${gap} s${gap_desc})"
+        gap="$(valve_gap "$streak")"
+        must_log "RECLAIM: true headroom ${before:-?} MiB < floor ${FLOOR_MIB} MiB -> dropped clean cache -> headroom ${after:-?} MiB (recovered ${recovered:-an unreadable amount} MiB; file pages ${fp:-?} MiB, shared memory ${sh:-?} MiB, mapped ${mem:-?} MiB; next drop allowed in ${gap} s)"
         # Any integer counts, a negative one included (a burst ate more than
         # the drop freed); only an unreadable amount is passed over.
         case "${recovered#-}" in
           ''|*[!0-9]*) ;;
           *) if [ "$recovered" -lt "$MIN_DROPPABLE_MIB" ]; then
-               # Under the line a poor drop every MIN_GAP is the design, not a
-               # diagnosis of what holds the margin: the classic sentence is
-               # for the other case, where it is what the back-off rests on.
-               # Under the line only what is true by construction is said: the
-               # drop gave back little (a burst may even have eaten more than it
-               # freed, which reads as a negative recovery).
-               if [ -n "$gap" ] && valve_lifted "$after"; then
-                 must_log "LOW: that drop recovered less than ${MIN_DROPPABLE_MIB} MiB — that drop gave back little; waiting ${gap} s before the next try — while the margin stays under ${NO_THROTTLE_MIB} MiB"
-               else
-                 must_log "LOW: that drop recovered less than ${MIN_DROPPABLE_MIB} MiB — the margin is held by what the processes themselves have, not by clean file cache; waiting ${gap} s before the next try${low_desc}"
-               fi
+               must_log "LOW: that drop recovered less than ${MIN_DROPPABLE_MIB} MiB — the margin is held by what the processes themselves have, not by clean file cache; waiting ${gap} s before the next try"
              fi ;;
         esac
         row="$hr,$fp,$sh,$mem,$avail,$free,DROPPED->${after:-?}"
       else
         # A failed drop starts the wait and lengthens it: a helper that is
-        # missing or not granted is not retried every reading. It also turns
-        # the lift off until a drop succeeds.
-        streak=$(( streak + 1 )); try_failed=1; gap="$(valve_wait "$before" "$streak" 1)"
+        # missing or not granted is not retried every reading.
+        streak=$(( streak + 1 )); gap="$(valve_gap "$streak")"
         must_log "RECLAIM FAILED at true headroom ${before:-?} MiB (exit ${rc}${err:+; $err}): is ${RECLAIM} installed, executable and granted in sudoers? Run it by hand to see its error. Next try in ${gap} s"
         row="$hr,$fp,$sh,$mem,$avail,$free,DROP-FAILED"
       fi
@@ -329,11 +253,11 @@ if [ "${VALVE_LIB_ONLY:-0}" = "1" ]; then return 0 2>/dev/null || exit 0; fi
 # an errored comparison reads as false — which could let a drop through. The
 # same holds for a number too large for the shell's arithmetic, so settings
 # are capped at nine digits, far below it.
-for setting in "$FLOOR_MIB" "$INTERVAL" "$MIN_GAP" "$MAX_GAP" "$MIN_DROPPABLE_MIB" "$NO_THROTTLE_MIB"; do
+for setting in "$FLOOR_MIB" "$INTERVAL" "$MIN_GAP" "$MAX_GAP" "$MIN_DROPPABLE_MIB"; do
   case "$setting" in
-    '') printf 'mem-floor-valve: FLOOR_MIB, INTERVAL, MIN_GAP, MAX_GAP, MIN_DROPPABLE_MIB and NO_THROTTLE_MIB must be whole numbers\n' >&2; exit 2 ;;
-    *[!0-9]*) printf 'mem-floor-valve: FLOOR_MIB, INTERVAL, MIN_GAP, MAX_GAP, MIN_DROPPABLE_MIB and NO_THROTTLE_MIB must be whole numbers (got "%s")\n' "$setting" >&2; exit 2 ;;
-    ??????????*) printf 'mem-floor-valve: FLOOR_MIB, INTERVAL, MIN_GAP, MAX_GAP, MIN_DROPPABLE_MIB and NO_THROTTLE_MIB must be at most nine digits (got "%s")\n' "$setting" >&2; exit 2 ;;
+    '') printf 'mem-floor-valve: FLOOR_MIB, INTERVAL, MIN_GAP, MAX_GAP and MIN_DROPPABLE_MIB must be whole numbers\n' >&2; exit 2 ;;
+    *[!0-9]*) printf 'mem-floor-valve: FLOOR_MIB, INTERVAL, MIN_GAP, MAX_GAP and MIN_DROPPABLE_MIB must be whole numbers (got "%s")\n' "$setting" >&2; exit 2 ;;
+    ??????????*) printf 'mem-floor-valve: FLOOR_MIB, INTERVAL, MIN_GAP, MAX_GAP and MIN_DROPPABLE_MIB must be at most nine digits (got "%s")\n' "$setting" >&2; exit 2 ;;
   esac
 done
 if [ "$INTERVAL" -eq 0 ] || [ "$MIN_GAP" -eq 0 ] || [ "$MAX_GAP" -eq 0 ]; then
@@ -346,7 +270,6 @@ fi
 FLOOR_MIB=$((10#$FLOOR_MIB));      INTERVAL=$((10#$INTERVAL))
 MIN_GAP=$((10#$MIN_GAP));          MAX_GAP=$((10#$MAX_GAP))
 MIN_DROPPABLE_MIB=$((10#$MIN_DROPPABLE_MIB))
-NO_THROTTLE_MIB=$((10#$NO_THROTTLE_MIB))
 
 if [ "$#" -eq 1 ] && [ "${1:-}" = "--status" ]; then
   # One reading, and what a valve whose wait is open would decide. This does

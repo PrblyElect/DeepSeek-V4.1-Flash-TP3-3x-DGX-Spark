@@ -315,14 +315,6 @@ next follows as soon as 30 s later. A node whose margin is held by its
 processes, not by cache, therefore sees at most one drop every ten
 minutes, and every attempt says in the log what it gave back.
 
-One exception, at the lowest margins: under 300 MiB of true headroom that
-wait does not grow. The next try follows 30 s later however many poor drops
-came before it, because a drop there can give back far more than the ones
-before it, and waiting is then the costlier error. A try that fails brings
-the longer wait back at once. `NO_THROTTLE_MIB=0` turns the exception off. It
-is a drop every 30 s for as long as the margin stays that low; the cost of a
-drop measured below is of single drops, not of a long run of them.
-
 Leaving it running beside the engine was measured — in one installation,
 on a node that was not swapping (`vm.swappiness=0`). A drop cannot reach
 the model: the weights are in device memory, with `LOAD_FORMAT=b12x` the
@@ -339,9 +331,9 @@ doing harm:
 - **It never drops blind.** A margin it cannot read waits — and the valve
   says so, once, in its log.
 - **It says what happened.** When a drop gives back little it writes `LOW`
-  to its log and waits longer — except under 300 MiB, where it keeps trying
-  at the minimum wait. It cannot create memory: a margin held by
-  what the processes themselves have is not something a drop gives back.
+  to its log and waits longer. It cannot create memory: a margin held by
+  what the processes themselves have is not something a drop gives back,
+  nor is one a growing process is eating (FIXLOG 39).
 - **It does not trip on a healthy node.** With the margin at or over the
   floor it does nothing.
 
@@ -1005,7 +997,29 @@ same gate asserts).
 
 ## Changelog
 
-- **2026-11 (v1.14.0 — the valve keeps trying at the lowest margins)** —
+- **2026-11 (v1.14.1 — the valve's exception is withdrawn)** —
+  one change, undoing v1.14.0's. A node running that valve froze and
+  was rebooted. Through an afternoon of long-prompt traffic its margin
+  sat low — under the exception's line in 9 to 32 per cent of each of
+  the last four hours' ten-second readings, and in more than half of
+  the last twenty minutes' readings — and under the exception the
+  valve dropped its clean cache as often as every 30 s. In the last
+  ten minutes every drop but the last gave back only a few tens of
+  MiB; at the last the valve read under 200 MiB of file pages, about
+  870 MiB ten seconds earlier, and recovered nothing; seconds later
+  the node ran out of memory. What used the memory was the API server,
+  whose anonymous memory grew by about 1.4 GiB in about four minutes;
+  what made it grow is not recorded. The exception's premise — that a
+  drop from under the line can give back many times the typical drop —
+  is not what its last sixteen drops showed. So
+  `tools/mem-floor-valve.sh` and its desk test are v1.13.0's again,
+  byte for byte, and `NO_THROTTLE_MIB` is gone; a unit file that still
+  sets it changes nothing (FIXLOG 39). v1.14.0's two corrected notes
+  stand. Not fixed by this release: the API server's growth under
+  long-prompt traffic, and the margin of the node that carries it
+  (FIXLOG 36, 39).
+- **2026-11 (v1.14.0 — the valve keeps trying at the lowest margins; its
+  one change to the valve is withdrawn in v1.14.1, FIXLOG 39)** —
   one change, to `tools/mem-floor-valve.sh`. Its back-off — the wait that
   doubles after each drop that gives back little — is for a node whose
   margin is held by its processes, where another drop cannot help. On a

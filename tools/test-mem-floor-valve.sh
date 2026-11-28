@@ -4,8 +4,7 @@
 # Needs bash, awk, sed, grep and perl (a portable timeout) — and ps, for one
 # case. Needs no box, no root and no network, and is safe on a serving node. The
 # decision is a set of pure functions; the readers are run against fixture
-# files; and the loop runs with its readings and its privileged call replaced
-# (and, where the seconds between readings matter, with a clock of its own).
+# files; and the loop runs with its readings and its privileged call replaced.
 # Nothing here can reach the kernel: the helper the valve is given is a
 # stand-in that only appends a line to a file (or, in one case, puts the valve
 # itself out of its misery), `sudo` is a shell function that runs that
@@ -55,7 +54,7 @@ export SUDO_CALLS RECLAIM_CALLS
 # The functions are read out of the valve itself, never copied here: a test
 # with its own copy of the decision only tests itself.
 part "the valve as a library"
-FUNCS="valve_decide valve_gap valve_wait valve_lifted valve_recovered valve_next_streak zone_headroom_mib cache_mib meminfo_mib valve_loop log must_log valve_reclaim"
+FUNCS="valve_decide valve_gap valve_recovered valve_next_streak zone_headroom_mib cache_mib meminfo_mib valve_loop log must_log valve_reclaim"
 IMPORT="$(within 5 env VALVE_LIB_ONLY=1 bash -c 'source "$1" && declare -f '"$FUNCS" _ "$VALVE" 2>/dev/null)"
 CSV_HEADER="$(within 5 env VALVE_LIB_ONLY=1 bash -c 'source "$1" && printf "%s" "$CSV_HEADER"' _ "$VALVE" 2>/dev/null)"
 # The loop names its input files in its log lines: take the valve's own values.
@@ -66,14 +65,9 @@ for f in $FUNCS; do declare -F "$f" >/dev/null 2>&1 || missing="$missing $f"; do
 [ -z "$missing" ] && [ -n "$CSV_HEADER" ]
 check "sourced with VALVE_LIB_ONLY=1, it defines every function and its header, and does not run" $? "missing:$missing"
 FLOOR_MIB=1000; INTERVAL=0; MIN_GAP=30; MAX_GAP=600; MIN_DROPPABLE_MIB=128
-# The back-off is what the cases below exercise, so its lift is off for them;
-# it has a part of its own.
-NO_THROTTLE_MIB=0
-NT_DEFAULT="$(within 5 env VALVE_LIB_ONLY=1 bash -c 'source "$1" && printf "%s" "$NO_THROTTLE_MIB"' _ "$VALVE" 2>/dev/null)"
 
 decides() {   # $1 the case  $2 expected  $3 headroom  $4 seconds since the last drop  $5 the streak
-              # $6 optional: 1 = the last try failed
-  local got; got="$(valve_decide "$3" "$4" "$5" ${6:+"$6"} 2>/dev/null)"
+  local got; got="$(valve_decide "$3" "$4" "$5" 2>/dev/null)"
   [ "$got" = "$2" ]; check "$1 -> $2" $? "got '$got'"
 }
 is() {       # $1 the case  $2 got  $3 want
@@ -166,72 +160,6 @@ got="$(valve_recovered 10 xyz 2>/dev/null)"; empty "recovered: a non-numeric aft
 got="$(valve_recovered FLOOR_MIB 1010 2>/dev/null)"; empty "recovered: a 'before' that is the name of a number in scope (the arithmetic alone would return 10)" "$got"
 got="$(valve_recovered 10 "" 2>/dev/null)";  empty "recovered: an unreadable after"  "$got"
 
-part "the decision: no back-off under NO_THROTTLE_MIB"
-# The lift, on its own: under a set margin the wait does not grow with the streak.
-FLOOR_MIB=1000; MIN_GAP=30; MAX_GAP=600
-is  "the shipped default"                                                              "$NT_DEFAULT"      300
-NO_THROTTLE_MIB=300
-decides "under the line, 31 s after a drop, five poor drops behind it: no back-off"    DROP               250 31  5
-decides "under the line, 31 s after a drop, nine poor drops behind it: still none"     DROP               250 31  9
-decides "under the line, 30 s after a drop: that is the minimum wait"                  DROP               250 30  5
-decides "under the line, 29 s after a drop: the minimum wait still holds"              "WAIT:throttled"   250 29  5
-decides "under the line, unreadable clock: still waits"                                "WAIT:throttled"   250 ""  5
-decides "under the line, non-numeric clock: still waits"                               "WAIT:throttled"   250 soon 5
-decides "free below the reserve line, nine poor drops behind it: no back-off"          DROP               -20 31  9
-decides "above the line, 31 s after a drop, five poor drops behind it: the back-off holds there"  "WAIT:throttled" 350 31  5
-decides "above the line, 239 s after a drop, three poor drops behind it: still held"   "WAIT:throttled"   350 239 3
-decides "above the line, 240 s after that drop: it has elapsed"                        DROP               350 240 3
-decides "exactly at the line: not under it, so the back-off holds"                     "WAIT:throttled"   300 31  5
-decides "under the line after a FAILED try: the back-off is back"                      "WAIT:throttled"   250 31  1 1
-decides "under the line after a failed try: 60 s is the wait after one failure"        DROP               250 60  1 1
-decides "under the line after a failed try: 59 s is not"                               "WAIT:throttled"   250 59  1 1
-decides "under the line after a failed try, nine failures deep: 599 s is not enough"   "WAIT:throttled"   250 599 9 1
-decides "under the line after a failed try, nine failures deep: 600 s is"              DROP               250 600 9 1
-decides "under the line, the last try failed given as anything but 1: read as not failed"  DROP            250 31  5 x
-FLOOR_MIB=200
-decides "a floor under the line: between them is still no drop"                        "WAIT:headroom-ok" 250 999 9
-decides "a floor under the line: under both, no back-off"                              DROP               150 31  9
-FLOOR_MIB=1000
-NO_THROTTLE_MIB=0
-decides "NO_THROTTLE_MIB=0: the back-off holds, under the line"                        "WAIT:throttled"   250 31  5
-decides "NO_THROTTLE_MIB=0: and free below the reserve line — the switch is off everywhere"  "WAIT:throttled" -20 31  5
-decides "NO_THROTTLE_MIB=0: one poor drop behind, 60 s is enough"                      DROP               250 60  1
-NO_THROTTLE_MIB=abc
-decides "a value that is not a whole number: the back-off holds"                       "WAIT:throttled"   250 31  5
-decides "a value that is not a whole number: below the reserve line too"               "WAIT:throttled"   -20 31  5
-NO_THROTTLE_MIB=12345678901
-decides "a value over the nine-digit cap: the back-off holds"                          "WAIT:throttled"   250 31  5
-NO_THROTTLE_MIB=0300
-decides "a zero-padded value is read in base 10: 299 is under 0300"                    DROP               299 31  5
-decides "a zero-padded value is read in base 10: 300 is not under 0300"                "WAIT:throttled"   300 31  5
-NO_THROTTLE_MIB=300; MIN_GAP=0090; MAX_GAP=0600
-decides "under the line with a zero-padded minimum wait: 89 s waits"                   "WAIT:throttled"   250 89  5
-decides "under the line with a zero-padded minimum wait: 90 s drops"                   DROP               250 90  5
-is  "  and the wait itself comes back as plain digits: a zero-padded 0090 is 90"       "$(MIN_GAP=0090 valve_wait 250 3)"          90
-MIN_GAP=abc; MAX_GAP=600
-decides "a minimum wait that is not a whole number: waits, under the line too"         "WAIT:throttled"   250 31  5
-MIN_GAP=30; MAX_GAP=""
-decides "an empty maximum wait: waits, under the line too"                             "WAIT:throttled"   250 31  5
-MIN_GAP=30; MAX_GAP=600
-is  "the wait as a function: under the line it is the minimum, whatever the streak"    "$(valve_wait 250 9)"                      30
-is  "  above the line it is the streak's"                                             "$(valve_wait 350 3)"                      240
-is  "  after a good drop it is the minimum either way"                                "$(valve_wait 350 0)"                      30
-is  "  under the line after a failed try it is the streak's"                          "$(valve_wait 250 3 1)"                    240
-is  "  with the lift off it is the streak's"                                          "$(NO_THROTTLE_MIB=0 valve_wait 250 3)"    240
-is  "  with a value that is not a whole number it is the streak's"                    "$(NO_THROTTLE_MIB=abc valve_wait 250 3)"  240
-is  "  after a failed try given as anything but 1: lifted"                            "$(valve_wait 250 3 x)"                    30
-is  "  an unreadable margin leaves the streak's wait"                                 "$(valve_wait abc 3)"                      240
-MIN_GAP=90; MAX_GAP=50
-is  "  under the line with the minimum above the cap: the cap holds, as anywhere"     "$(valve_wait 250 3)"                      50
-MIN_GAP=30; MAX_GAP=600
-got="$(MIN_GAP=abc valve_wait 250 3)";  empty "  a minimum wait that is not a whole number -> EMPTY" "$got"
-lifts() { NO_THROTTLE_MIB="$1" valve_lifted "$2" && echo lifted || echo held; }
-got="$(lifts 300 250) $(lifts 300 300) $(lifts 300 350) $(lifts 0 250) $(lifts 0 -20) $(lifts 300 -20) $(lifts abc 250) $(lifts 300 abc) $(lifts '' 250) $(lifts 12345678901 250)"
-is  "lifted only under the line and only with the line above 0: not at it, not above it, not switched off, never on an unreadable margin or value"  "$got"  "lifted held held held held lifted held held held held"
-got="$(lifts 300 +250) $(lifts 300 0xF0)"
-is  "  and never on a margin in a form the shell's test would still take as a number (+250, 0xF0): unreadable here"  "$got"  "held held"
-NO_THROTTLE_MIB=0
-
 part "the readers, against fixture files"
 got="$(zone_headroom_mib "$ZONE")";  [ "$got" = 1300 ]; check "headroom: reads the Normal zone, not the zone before or after, and not nr_free_pages (want 1300)" $? "got '$got'"
 sed 's/pages free     398336/pages free      60000/' "$ZONE" > "$ZONE.neg"
@@ -278,16 +206,8 @@ run_loop() {
     [ -n "$LOOP_PID" ] || { echo "HARNESS: the loop's shell does not know its own PID; the loop is not run" >&2; exit 98; }
     echo "$LOOP_PID" > "$TMP/loop-pid"
     LOG="$LOGF"; CSV="$CSVF"; RECLAIM="$FAKE_RECLAIM"
-    INTERVAL=0; FLOOR_MIB=1000; MIN_GAP=30; MAX_GAP=600; MIN_DROPPABLE_MIB=128; NO_THROTTLE_MIB=0
+    INTERVAL=0; FLOOR_MIB=1000; MIN_GAP=30; MAX_GAP=600; MIN_DROPPABLE_MIB=128
     eval "${VALVE_OPTS:-}"
-    if [ -n "${CLOCK_STEP:-}" ]; then      # a clock that advances CLOCK_STEP seconds per reading
-      # The count lives in a file: the loop takes the clock inside `$(...)`, a
-      # subshell, so a shell variable cannot advance from one reading to the next.
-      date() { case "$1" in +%s)
-                 local n; n=$(( $(cat "$TMP/n-clock" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$TMP/n-clock"
-                 echo $(( 1000000 + n * CLOCK_STEP )) ;;
-               *) command date "$@" ;; esac; }
-    fi
     zone_headroom_mib() {
       # Watchdog. Each drop costs one extra reading, so a $READINGS-reading
       # scenario can never legitimately need more than this many. A loop that
@@ -314,19 +234,15 @@ run_loop() {
   )
 }
 scenario() {   # KEY=VALUE ... (quote values that contain spaces); starts from a clean slate
-  rm -rf "$SUDO_CALLS" "$RECLAIM_CALLS" "$TMP/n-hr" "$TMP/watchdog" "$TMP/n-clock" "$TMP/failed-once"
-  SEQ_HR=""; HELPER_RC=0; HELPER_SAYS=""; READINGS=3; VALVE_OPTS=""; KEEP_STATE=0; NO_CSV_ROWS=0; SLEEP_STUB=""; CLOCK_STEP=""; HELPER_FAIL_FIRST=0
+  rm -rf "$SUDO_CALLS" "$RECLAIM_CALLS" "$TMP/n-hr" "$TMP/watchdog"
+  SEQ_HR=""; HELPER_RC=0; HELPER_SAYS=""; READINGS=3; VALVE_OPTS=""; KEEP_STATE=0; NO_CSV_ROWS=0; SLEEP_STUB=""
   local kv; for kv in "$@"; do eval "$kv"; done
   # After the arguments, not before: KEEP_STATE is one of them.
   chmod -R u+w "$TMP/state" 2>/dev/null
   [ "$KEEP_STATE" = 1 ] || rm -rf "$TMP/state"
   # shellcheck disable=SC2086  # word-splitting is the point: one reading per line
   printf '%s\n' $SEQ_HR > "$TMP/seq-hr"
-  printf '#!/bin/sh\nprintf "ran\\n" >> "%s"\n' "$RECLAIM_CALLS" > "$FAKE_RECLAIM"
-  if [ "$HELPER_FAIL_FIRST" = 1 ]; then     # fails on its first call only, then behaves as told
-    printf 'if [ ! -e "%s" ]; then : > "%s"; echo "helper: not ready" >&2; exit 1; fi\n' "$TMP/failed-once" "$TMP/failed-once" >> "$FAKE_RECLAIM"
-  fi
-  printf 'printf "%%s\\n" "%s" >&2\nexit %s\n' "$HELPER_SAYS" "$HELPER_RC" >> "$FAKE_RECLAIM"
+  printf '#!/bin/sh\nprintf "ran\\n" >> "%s"\nprintf "%%s\\n" "%s" >&2\nexit %s\n' "$RECLAIM_CALLS" "$HELPER_SAYS" "$HELPER_RC" > "$FAKE_RECLAIM"
   chmod +x "$FAKE_RECLAIM"
   rows_before="$(data_rows)"
   if [ -n "${LOOP_ERR:-}" ]; then run_loop 2> "$LOOP_ERR"; else run_loop; fi
@@ -344,10 +260,6 @@ scenario() {   # KEY=VALUE ... (quote values that contain spaces); starts from a
     rows=$(( $(data_rows) - rows_before ))
     [ "$rows" -eq "$READINGS" ]
     check "  (harness) and wrote them to the CSV" $? "the CSV gained $rows data rows"
-  fi
-  if [ -n "${CLOCK_STEP:-}" ]; then     # with a clock of its own, the loop must have read that clock
-    [ "$(cat "$TMP/n-clock" 2>/dev/null || echo 0)" = "$READINGS" ]
-    check "  (harness) and read its clock once per reading" $? "clock reads $(cat "$TMP/n-clock" 2>/dev/null || echo 0), readings $READINGS"
   fi
 }
 count()    { if [ -f "$2" ]; then wc -l < "$2" | tr -d ' '; else echo 0; fi; }
@@ -432,10 +344,8 @@ scenario 'SEQ_HR="-40 1300 1300"' HELPER_RC=0 READINGS=3
 expect "free below the reserve line: it drops at once"        "$(count x "$RECLAIM_CALLS")" "1"
 expect_has "  and the log shows the negative margin"           "RECLAIM: true headroom -40 MiB < floor 1000 MiB"
 
-scenario 'SEQ_HR="1500"' READINGS=1 'VALVE_OPTS="FLOOR_MIB=777 MIN_GAP=5 MAX_GAP=50 MIN_DROPPABLE_MIB=9 NO_THROTTLE_MIB=300"' 
-expect "the start line carries the settings in effect"        "$(log_has 'started (true-headroom floor 777 MiB, interval 0s, min gap 5s, max gap 50s, a drop that recovers less than 9 MiB doubles the wait, no back-off under 300 MiB, reclaim=')" "1"
-scenario 'SEQ_HR="1500"' READINGS=1 'VALVE_OPTS="NO_THROTTLE_MIB=0"'
-expect "  with the lift switched off it says so, and does not read 'under 0 MiB'" "$(log_has 'doubles the wait, the back-off lifted nowhere, reclaim=')" "1"
+scenario 'SEQ_HR="1500"' READINGS=1 'VALVE_OPTS="FLOOR_MIB=777 MIN_GAP=5 MAX_GAP=50 MIN_DROPPABLE_MIB=9"' 
+expect "the start line carries the settings in effect"        "$(log_has 'started (true-headroom floor 777 MiB, interval 0s, min gap 5s, max gap 50s, a drop that recovers less than 9 MiB doubles the wait,')" "1"
 
 scenario 'SEQ_HR="x x x"' READINGS=3
 expect "unreadable headroom: the helper is never called"      "$(count x "$RECLAIM_CALLS")" "0"
@@ -448,63 +358,6 @@ expect "blind, then able to read again: both said once"       "$(log_has 'UNREAD
 expect_has "  and it says when it can see again"              "READABLE: the margin can be read again — true headroom 1500 MiB"
 log_order " UNREADABLE: the margin" " READABLE: the margin"     # anchored: READABLE is inside UNREADABLE
 check "  in that order" $? "READABLE is not after UNREADABLE"
-
-part "the loop with no back-off under the line (its clock replaced too)"
-# The valve reads the clock once per reading. A stub that advances a set number
-# of seconds on each of those readings makes the time between readings exact.
-scenario 'SEQ_HR="250 250 250 250 250 250 250 250 250 250"' READINGS=5 CLOCK_STEP=31 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "under the line, 31 s between readings: a drop at every reading, poor as each one is" "$(decisions)" "DROPPED->250 DROPPED->250 DROPPED->250 DROPPED->250 DROPPED->250 "
-expect "  five tries"                                                     "$(count x "$RECLAIM_CALLS")" "5"
-expect "  each attempt says the back-off is off"                          "$(log_has '(no back-off under 300 MiB)')" "5"
-expect "  each result states the minimum wait, the one the next decision uses" "$(log_has 'next drop allowed in 30 s while the margin stays under 300 MiB)')" "5"
-expect "  and says where that wait holds"                                "$(log_has 'waiting 30 s before the next try — while the margin stays under 300 MiB')" "5"
-expect "  each still counts as a poor drop"                              "$(log_has 'LOW: that drop recovered less than')" "5"
-expect "  each LOW line leaves out the diagnosis the back-off rests on: under the line a poor drop is the design" "$(log_has 'that drop gave back little; waiting')" "5"
-
-scenario 'SEQ_HR="250 250 250 250 250 250 250"' READINGS=5 CLOCK_STEP=10 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "under the line, 10 s between readings: the minimum wait still holds" "$(decisions)" "DROPPED->250 WAIT:throttled WAIT:throttled DROPPED->250 WAIT:throttled "
-expect "  two tries, not five"                                           "$(count x "$RECLAIM_CALLS")" "2"
-
-scenario 'SEQ_HR="250 250 250 250 250 250 500 500"' READINGS=5 CLOCK_STEP=31 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "the streak kept counting under the line: above it, three poor drops hold the valve back" "$(decisions)" "DROPPED->250 DROPPED->250 DROPPED->250 WAIT:throttled WAIT:throttled "
-expect "  three tries"                                                   "$(count x "$RECLAIM_CALLS")" "3"
-
-scenario 'SEQ_HR="250 250 250 250 250 250 250"' READINGS=5 CLOCK_STEP=31 HELPER_RC=1 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "a failed try brings the back-off back, under the line too"       "$(decisions)" "DROP-FAILED WAIT:throttled DROP-FAILED WAIT:throttled WAIT:throttled "
-expect "  two tries in five readings, not one per reading"               "$(count x "$RECLAIM_CALLS")" "2"
-expect_has "  the first failure: next try in 60 s"                       "Next try in 60 s"
-expect_has "  the second failure: next try in 120 s"                     "Next try in 120 s"
-expect "  only the first attempt's line says the back-off is off"        "$(log_has '(no back-off under 300 MiB)')" "1"
-
-scenario 'SEQ_HR="250 250 250 250 250 250 250 250 250"' READINGS=5 CLOCK_STEP=31 HELPER_FAIL_FIRST=1 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "a failed try, then a successful drop: the back-off is back until a drop succeeds, and lifted again after it" "$(decisions)" "DROP-FAILED WAIT:throttled DROPPED->250 DROPPED->250 DROPPED->250 "
-expect "  four tries in five readings"                               "$(count x "$RECLAIM_CALLS")" "4"
-expect  "  the lift's tag on the first attempt and the last two, not on the one after the failure" "$(log_has '(no back-off under 300 MiB)')" "3"
-expect_has "  the failure: next try in 60 s"                         "Next try in 60 s"
-expect  "  and the three good results state the lifted wait"        "$(log_has 'next drop allowed in 30 s while the margin stays under 300 MiB)')" "3"
-
-scenario 'SEQ_HR="350 350 350 350 350 250 250 250 250"' READINGS=5 CLOCK_STEP=31 HELPER_FAIL_FIRST=1 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "a failed try, a successful drop ABOVE the line, then the margin falls under it: the lift is back with that drop, wherever it happened" "$(decisions)" "DROP-FAILED WAIT:throttled DROPPED->350 DROPPED->250 DROPPED->250 "
-expect  "  four tries: one failed, three good"                       "$(count x "$RECLAIM_CALLS")" "4"
-expect  "  the lift's tag only where the margin is under the line"    "$(log_has '(no back-off under 300 MiB)')" "2"
-
-scenario 'SEQ_HR="250 350 350 350 350 350 350 350"' READINGS=5 CLOCK_STEP=31 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "a drop from under the line to above it: the attempt is tagged; the result is the streak's wait, with the minimum named beside it" "$(decisions)" "DROPPED->350 WAIT:throttled DROPPED->350 WAIT:throttled WAIT:throttled "
-expect  "  the attempt's tag once: the margin was under the line when it was made" "$(log_has '(no back-off under 300 MiB)')" "1"
-expect  "  the first result: the streak's wait for the margin it left, 60 s"      "$(log_has 'next drop allowed in 60 s, or 30 s once the margin is under 300 MiB)')" "1"
-expect  "  and never the lifted wording on a longer wait"                         "$(log_has '60 s while the margin stays under')" "0"
-expect_has "  the LOW line names the minimum the same way — as the other wait, not a part of this one" "waiting 60 s before the next try — the minimum, 30 s, once the margin is under 300 MiB"
-
-scenario 'SEQ_HR="250 200 250 250 250 250 250 250"' READINGS=3 CLOCK_STEP=31 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "a burst ate more than the drop freed: a negative recovery under the line" "$(decisions)" "DROPPED->200 DROPPED->250 DROPPED->250 "
-expect_has "  the result shows the negative recovery, and still the lifted wait" "recovered -50 MiB; file pages 900 MiB, shared memory 800 MiB, mapped 1600 MiB; next drop allowed in 30 s while the margin stays under 300 MiB)"
-expect_has "  and the LOW line says only what is true by construction"        "LOW: that drop recovered less than 128 MiB — that drop gave back little; waiting 30 s before the next try — while the margin stays under 300 MiB"
-expect  "  never a claim about clean file cache that this reading contradicts" "$(log_has 'clean file cache')" "0"
-
-scenario 'SEQ_HR="250 250 250 250 250 350 250 250 250 250"' READINGS=5 CLOCK_STEP=61 'VALVE_OPTS="NO_THROTTLE_MIB=300"'
-expect "a result written ABOVE the line states the streak's wait and the minimum — and 61 s later the margin is under the line and drops" "$(decisions)" "DROPPED->250 DROPPED->250 DROPPED->350 DROPPED->250 DROPPED->250 "
-expect  "  the 240 s line, with the minimum named beside it"                      "$(log_has 'next drop allowed in 240 s, or 30 s once the margin is under 300 MiB)')" "1"
-expect  "  so the log never promises a wait the next decision does not enforce"   "$(log_has '(61 s since the last drop) (no back-off under 300 MiB)')" "4"
 
 part "the CSV keeps an earlier layout readable"
 rm -rf "$TMP/state"; mkdir -p "$TMP/state"
@@ -555,8 +408,7 @@ refuses_start() {   # true only when the valve exits 2 AND names the setting AND
     && [ ! -e "$TMP/prog/state" ] && [ ! -f "$TMP/prog/reclaim.calls" ]
 }
 for kv in "FLOOR_MIB=abc" "INTERVAL=0" "MIN_GAP=0" "MAX_GAP=0" "MIN_DROPPABLE_MIB=-5" "MAX_GAP=10 MIN_GAP=30" \
-          "FLOOR_MIB=9999999999" "MIN_GAP=9999999999" \
-          "NO_THROTTLE_MIB=abc" "NO_THROTTLE_MIB=-1" "NO_THROTTLE_MIB=12345678901"; do
+          "FLOOR_MIB=9999999999" "MIN_GAP=9999999999"; do
   read -r -a parts <<<"$kv"
   refuses_start "${parts[@]}"
   check "settings $kv: refuses to start, naming the setting, writing nothing, calling nothing" $? \
@@ -589,31 +441,13 @@ check "  and takes readings, into a CSV with this layout's header" $? "header: $
 [ "$(grep -vc '^utc,\|^# ' "$TMP/prog/state/mem-floor.csv")" -ge 1 ]; check "  at least one reading was written" $? "no data rows"
 [ ! -f "$TMP/prog/reclaim.calls" ];        check "  and never reaches a drop on a healthy node, so sudo is never asked" $? "the helper was called"
 
-# The lift through the program itself, with the shipped default: a second
-# zone-info fixture at 250 MiB of true headroom (64,000 pages of 4 KiB), one second between
-# readings. The alarm ends the run.
-ZONE_LOW="$TMP/zonelow"
-printf '%s\n' 'Node 0, zone   DMA' '  pages free     100000' '        min      0' \
-  'Node 0, zone   Normal' '  pages free     129536' '        min      65536' > "$ZONE_LOW"
-rc="$(prog NO_THROTTLE_MIB=0 -- --status)"
-expect "NO_THROTTLE_MIB=0, the lift switched off: a setting the valve starts with" "$rc" "0"
-rc="$(prog VALVE_ZONEINFO="$ZONE_LOW" INTERVAL=1 --)"
-expect "under the line with nothing to give back: the valve runs on (ended here by the alarm)" "$rc" "142"
-expect "  and tried once in six seconds"                           "$(count x "$TMP/prog/reclaim.calls")" "1"
-grep -q "dropping clean cache (no back-off under 300 MiB)" "$TMP/prog/state/mem-floor.log" 2>/dev/null
-check "  the attempt says the back-off is off, by the shipped default" $? "log: $(head -c 240 "$TMP/prog/state/mem-floor.log" 2>/dev/null | tr '\n' '|')"
-grep -q "next drop allowed in 30 s while the margin stays under 300 MiB)" "$TMP/prog/state/mem-floor.log" 2>/dev/null
-check "  and the wait is the minimum, with the condition it holds under" $? "log: $(head -c 240 "$TMP/prog/state/mem-floor.log" 2>/dev/null | tr '\n' '|')"
-
 # A helper that never returns: the attempt is on record before the act, so the
 # log shows what the valve was doing when it stopped. (The stand-in needs ps
 # to find the valve's process; without ps the case is skipped, not failed.)
 if command -v ps >/dev/null 2>&1; then
-  rc="$(prog HELPER=kill FLOOR_MIB=2000 MIN_GAP=0090 MAX_GAP=0600 NO_THROTTLE_MIB=0300 --)"; expect "a helper that never returns: the valve is ended (here by the stand-in)" "$rc" "137"
+  rc="$(prog HELPER=kill FLOOR_MIB=2000 MIN_GAP=0090 MAX_GAP=0600 --)"; expect "a helper that never returns: the valve is ended (here by the stand-in)" "$rc" "137"
   grep -q "started (true-headroom floor 2000 MiB, interval 10s, min gap 90s, max gap 600s," "$TMP/prog/state/mem-floor.log"
   check "  and its start line shows zero-padded settings as plain numbers" $? "start line: $(head -n 1 "$TMP/prog/state/mem-floor.log" 2>/dev/null | cut -c1-110)"
-  grep -q "doubles the wait, no back-off under 300 MiB, reclaim=" "$TMP/prog/state/mem-floor.log" 2>/dev/null
-  check "  the back-off line among them" $? "start line: $(head -n 1 "$TMP/prog/state/mem-floor.log" 2>/dev/null | cut -c1-150)"
   [ -f "$TMP/prog/state/mem-floor.log" ] && grep -q "TRY: true headroom 1300 MiB < floor 2000 MiB; dropping clean cache" "$TMP/prog/state/mem-floor.log"
   try_ok=$?; check "  and its attempt is on record" $try_ok "no TRY line: $(cat "$TMP/prog/state/mem-floor.log" 2>/dev/null | cut -c1-120)"
   if [ "$try_ok" -ne 0 ]; then
